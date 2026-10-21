@@ -7,7 +7,7 @@
   "workers_dev": true,
   "preview_urls": true,
   "placement": {
-    "region": "aws:eu-central-1"
+    "region": "gcp:europe-west4"
   },
   "d1_databases": [
     {
