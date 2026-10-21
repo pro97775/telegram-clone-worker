@@ -13,7 +13,6 @@
     {
       "binding": "DB",
       "database_name": "telegram-clone-worker-db",
-      "database_id": "PASTE_YOUR_ACTUAL_UUID_HERE"
     }
   ],
   "triggers": {
