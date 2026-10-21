@@ -6,10 +6,14 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "preview_urls": true,
+  "placement": {
+    "region": "aws:eu-central-1"
+  },
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "telegram-clone-worker-db"
+      "database_name": "telegram-clone-worker-db",
+      "database_id": "YOUR_DATABASE_ID_HERE"
     }
   ],
   "triggers": {
