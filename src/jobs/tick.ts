@@ -223,10 +223,6 @@ export async function runTick(env: Env): Promise<void> {
       }
 
       // 2. Process tasks that have messages to copy (cursor <= end_id)
-      const activeBackfillCount = groupTasks.filter(
-        (t) => t.cursor !== null && t.end_id !== null && t.cursor <= t.end_id,
-      ).length;
-
       for (const task of groupTasks) {
         // If backfill was running but cursor has already caught up to or passed end_id, mark complete
         if (task.backfill_status === "running" && task.cursor !== null && task.end_id !== null && task.cursor > task.end_id) {
@@ -247,7 +243,7 @@ export async function runTick(env: Env): Promise<void> {
         if (!claimed) continue;
         try {
           batchesRun++;
-          const skipBotForRest = await processOneBatch(env, claimed, bot, client, activeBackfillCount);
+          const skipBotForRest = await processOneBatch(env, claimed, bot, client);
           if (skipBotForRest) break;
         } catch (e) {
           console.error(`tick: task ${claimed.id} failed`, e);
@@ -262,14 +258,9 @@ export async function runTick(env: Env): Promise<void> {
 
   // Also drain pending messages for live-enabled tasks that are not rate-limited
   const tasksWithPending = await listTasksWithPendingMessages(env.DB);
-  const skippedDrainBotIds = new Set<string>();
   for (const pTask of tasksWithPending) {
-    if (skippedDrainBotIds.has(pTask.bot_id)) continue;
     try {
-      const stopBotDrain = await drainPendingMessagesForTask(env, pTask);
-      if (stopBotDrain) {
-        skippedDrainBotIds.add(pTask.bot_id);
-      }
+      await drainPendingMessagesForTask(env, pTask);
     } catch (e) {
       console.error(`tick: draining pending messages for task ${pTask.id} failed`, e);
     }
@@ -320,18 +311,6 @@ async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise
         await stopTasksForBot(env.DB, task.bot_id, "unauthorized");
         return true;
       }
-      if (e instanceof TelegramApiError && (e.reason === "bot_not_in_chat" || e.reason === "insufficient_permissions")) {
-        // Isolate target error to this target task only; other target channels keep running
-        await stopTask(env.DB, task.id, e.reason);
-        await appendActivityLog(env.DB, {
-          task_id: task.id,
-          kind: "live_forward",
-          detail: `msg #${item.message_id}: ${e.reason} — target task auto-stopped`,
-          ok: false,
-          error,
-        });
-        return false;
-      }
       // If the message no longer exists in source, remove from queue to avoid blocking
       if (
         e instanceof TelegramApiError &&
@@ -340,8 +319,13 @@ async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise
           e.message.toLowerCase().includes("message to copy not found"))
       ) {
         await deletePendingMessages(env.DB, [item.id]);
-        await incrementActivityLogOrIgnore(env, task.id, item.message_id, error);
-        continue;
+        await appendActivityLog(env.DB, {
+          task_id: task.id,
+          kind: "live_forward",
+          detail: `msg #${item.message_id}: not found in source, removed from queue`,
+          ok: false,
+          error,
+        });
       }
       break;
     }
@@ -349,38 +333,18 @@ async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise
   return false;
 }
 
-async function incrementActivityLogOrIgnore(env: Env, taskId: string, messageId: number, error: string): Promise<void> {
-  await appendActivityLog(env.DB, {
-    task_id: taskId,
-    kind: "live_forward",
-    detail: `msg #${messageId}: not found in source, removed from queue`,
-    ok: false,
-    error,
-  });
-}
-
 /** Returns true when this call discovered the bot's token is dead (stopped
  * every task on it) or the bot just got rate-limited (paused every active
  * task on it) — either way runTick should skip the bot's other tasks for
  * the rest of this run instead of making more doomed Telegram calls. */
-async function processOneBatch(
-  env: Env,
-  task: TaskSummary,
-  botParam?: BotRow,
-  clientParam?: TelegramClient,
-  activeBackfillCount = 1,
-): Promise<boolean> {
+async function processOneBatch(env: Env, task: TaskSummary, botParam?: BotRow, clientParam?: TelegramClient): Promise<boolean> {
   if (task.cursor === null || task.end_id === null) return false;
   const bot = botParam ?? (await getBotWithSecrets(env.DB, task.bot_id));
   if (!bot) return false;
   const client = clientParam ?? new TelegramClient(bot.token);
 
   const batchStartedAtMs = Date.now();
-  const effectivePacingSize =
-    activeBackfillCount > 1
-      ? Math.max(5, Math.floor(task.pacing_batch_size / activeBackfillCount))
-      : task.pacing_batch_size;
-  const batchEnd = Math.min(task.cursor + effectivePacingSize - 1, task.end_id, task.cursor + MAX_BATCH_IDS - 1);
+  const batchEnd = Math.min(task.cursor + task.pacing_batch_size - 1, task.end_id, task.cursor + MAX_BATCH_IDS - 1);
   const messageIds: number[] = [];
   for (let id = task.cursor; id <= batchEnd; id++) messageIds.push(id);
 
