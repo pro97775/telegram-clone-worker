@@ -193,17 +193,16 @@ export async function runTick(env: Env): Promise<void> {
         }
       }
 
-      // 2. Process tasks that have messages to copy (cursor <= end_id).
-      // When 1 bot is backfilling to multiple target channels simultaneously, share the
-      // per-minute bot batch quota evenly across active backfill tasks on that bot so all
-      // target channels advance every tick without tripping Telegram's 60 msg/min per-bot limit.
+      // 2. Process running backfill tasks (backfill_status === 'running' and cursor <= end_id).
       const activeBackfillTasksInGroup = groupTasks.filter(
-        (t) => t.cursor !== null && t.end_id !== null && t.cursor <= t.end_id,
+        (t) => t.backfill_status === "running" && t.cursor !== null && t.end_id !== null && t.cursor <= t.end_id,
       );
       const concurrentBackfillCount = Math.max(1, activeBackfillTasksInGroup.length);
 
       for (const task of groupTasks) {
-        if (task.backfill_status === "running" && task.cursor !== null && task.end_id !== null && task.cursor > task.end_id) {
+        if (task.backfill_status !== "running") continue;
+
+        if (task.cursor !== null && task.end_id !== null && task.cursor > task.end_id) {
           const res = await advanceTaskProgress(env.DB, task.id, {
             cursor: task.cursor,
             processed: task.processed,
@@ -211,6 +210,7 @@ export async function runTick(env: Env): Promise<void> {
             backfill_status: "complete",
           });
           task.backfill_status = res.backfill_status;
+          continue;
         }
 
         if (task.cursor === null || task.end_id === null || task.cursor > task.end_id) {
@@ -238,16 +238,28 @@ export async function runTick(env: Env): Promise<void> {
     }
   });
 
-  // Also drain pending messages for live-enabled tasks that are not rate-limited
+  // 3. Drain pending messages for live-enabled tasks that are not rate-limited,
+  // protected by claimTask lease and per-bot pacing budget so multi-target live tasks never overlap or flood-wait.
   const tasksWithPending = await listTasksWithPendingMessages(env.DB);
+  const pendingCountByBot = new Map<string, number>();
+  for (const pt of tasksWithPending) {
+    pendingCountByBot.set(pt.bot_id, (pendingCountByBot.get(pt.bot_id) ?? 0) + 1);
+  }
+
   const pausedOrStoppedBots = new Set<string>();
   for (const pTask of tasksWithPending) {
     if (pausedOrStoppedBots.has(pTask.bot_id)) continue;
+    const claimed = await claimTask(env.DB, pTask.id, LEASE_SECONDS);
+    if (!claimed) continue;
     try {
-      const botPaused = await drainPendingMessagesForTask(env, pTask);
+      const siblingCount = pendingCountByBot.get(pTask.bot_id) ?? 1;
+      const perTaskLimit = siblingCount > 1 ? Math.max(10, Math.floor(60 / siblingCount)) : 60;
+      const botPaused = await drainPendingMessagesForTask(env, claimed, perTaskLimit);
       if (botPaused) pausedOrStoppedBots.add(pTask.bot_id);
     } catch (e) {
       console.error(`tick: draining pending messages for task ${pTask.id} failed`, e);
+    } finally {
+      await releaseTaskLease(env.DB, claimed.id);
     }
   }
 
@@ -256,10 +268,10 @@ export async function runTick(env: Env): Promise<void> {
 }
 
 /** Drains buffered live messages in chronological order once backfill completes. */
-async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise<boolean> {
+async function drainPendingMessagesForTask(env: Env, task: TaskSummary, limit = 60): Promise<boolean> {
   if (task.backfill_status === "running") return false;
 
-  const pending = await listPendingMessages(env.DB, task.id, 60);
+  const pending = await listPendingMessages(env.DB, task.id, limit);
   if (pending.length === 0) return false;
 
   const bot = await getBotWithSecrets(env.DB, task.bot_id);
@@ -294,6 +306,17 @@ async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise
       if (e instanceof TelegramApiError && e.reason === "unauthorized") {
         await stopTasksForBot(env.DB, task.bot_id, "unauthorized");
         return true;
+      }
+      if (e instanceof TelegramApiError && (e.reason === "bot_not_in_chat" || e.reason === "insufficient_permissions")) {
+        await stopTask(env.DB, task.id, e.reason);
+        await appendActivityLog(env.DB, {
+          task_id: task.id,
+          kind: "live_forward",
+          detail: `msg #${item.message_id}: ${e.reason} — task auto-stopped`,
+          ok: false,
+          error,
+        });
+        return false;
       }
       if (
         e instanceof TelegramApiError &&

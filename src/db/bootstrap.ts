@@ -12,6 +12,14 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
   if (bootstrapDone) return;
 
   try {
+    const existingTables = await db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tasks', 'saved_channels')")
+      .all<{ name: string }>();
+
+    const tableSet = new Set((existingTables.results ?? []).map((r) => r.name));
+    const tasksExisted = tableSet.has("tasks");
+    const savedChannelsExisted = tableSet.has("saved_channels");
+
     // Ensure app_settings and saved_channels tables always exist (even on pre-existing deployments)
     await db.batch([
       db.prepare(`CREATE TABLE IF NOT EXISTS app_settings (
@@ -30,23 +38,22 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
       db.prepare(`CREATE INDEX IF NOT EXISTS idx_saved_channels_created_at ON saved_channels(created_at DESC)`),
     ]);
 
-    const existing = await db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
-      .first<{ name: string }>();
-
-    if (existing) {
-      // Backfill any existing task source/destination channels into saved_channels automatically
-      try {
-        await db.batch([
-          db.prepare(`INSERT OR IGNORE INTO saved_channels (id, chat_id, title, chat_type)
-            SELECT lower(hex(randomblob(16))), source_chat_id, COALESCE(source_chat_title, source_chat_id), 'channel'
-            FROM tasks WHERE source_chat_id IS NOT NULL AND source_chat_id != '' GROUP BY source_chat_id`),
-          db.prepare(`INSERT OR IGNORE INTO saved_channels (id, chat_id, title, chat_type)
-            SELECT lower(hex(randomblob(16))), dest_chat_id, COALESCE(dest_chat_title, dest_chat_id), 'channel'
-            FROM tasks WHERE dest_chat_id IS NOT NULL AND dest_chat_id != '' GROUP BY dest_chat_id`),
-        ]);
-      } catch {
-        // Non-fatal if tasks table is empty or being migrated
+    if (tasksExisted) {
+      // Run one-time seed of existing task channels ONLY when saved_channels table is first created,
+      // so channels later deleted by the user are never re-inserted on worker cold starts.
+      if (!savedChannelsExisted) {
+        try {
+          await db.batch([
+            db.prepare(`INSERT OR IGNORE INTO saved_channels (id, chat_id, title, chat_type)
+              SELECT lower(hex(randomblob(16))), source_chat_id, COALESCE(source_chat_title, source_chat_id), 'channel'
+              FROM tasks WHERE source_chat_id IS NOT NULL AND source_chat_id != '' GROUP BY source_chat_id`),
+            db.prepare(`INSERT OR IGNORE INTO saved_channels (id, chat_id, title, chat_type)
+              SELECT lower(hex(randomblob(16))), dest_chat_id, COALESCE(dest_chat_title, dest_chat_id), 'channel'
+              FROM tasks WHERE dest_chat_id IS NOT NULL AND dest_chat_id != '' GROUP BY dest_chat_id`),
+          ]);
+        } catch {
+          // Non-fatal
+        }
       }
       bootstrapDone = true;
       return;

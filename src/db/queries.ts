@@ -123,7 +123,6 @@ export async function updateBotLabel(db: D1Database, id: string, label: string):
 }
 
 export async function deleteBot(db: D1Database, id: string): Promise<void> {
-  // tasks/task_activity_log/updates cascade via ON DELETE CASCADE
   await db.prepare(`DELETE FROM bots WHERE id = ?`).bind(id).run();
 }
 
@@ -144,23 +143,27 @@ export async function getSavedChannel(db: D1Database, id: string): Promise<Saved
   return row ?? null;
 }
 
-export async function findSavedChannelByChatId(db: D1Database, chatId: string, username?: string | null): Promise<SavedChannel | null> {
+export async function findSavedChannelsMatching(
+  db: D1Database,
+  chatId: string,
+  username?: string | null,
+): Promise<SavedChannel[]> {
   if (username) {
     const cleanUser = username.replace(/^@/, "").toLowerCase();
-    const row = await db
+    const { results } = await db
       .prepare(
         `SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels
-         WHERE chat_id = ? OR LOWER(chat_id) = ? OR LOWER(username) = ?`,
+         WHERE LOWER(chat_id) = LOWER(?) OR LOWER(chat_id) = ? OR LOWER(username) = ?`,
       )
       .bind(chatId, `@${cleanUser}`, cleanUser)
-      .first<SavedChannel>();
-    return row ?? null;
+      .all<SavedChannel>();
+    return results;
   }
-  const row = await db
-    .prepare(`SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels WHERE chat_id = ?`)
+  const { results } = await db
+    .prepare(`SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels WHERE LOWER(chat_id) = LOWER(?)`)
     .bind(chatId)
-    .first<SavedChannel>();
-  return row ?? null;
+    .all<SavedChannel>();
+  return results;
 }
 
 export async function upsertSavedChannel(
@@ -173,20 +176,36 @@ export async function upsertSavedChannel(
     preserveCustomTitle?: boolean;
   },
 ): Promise<SavedChannel> {
-  const existing = await findSavedChannelByChatId(db, input.chat_id, input.username);
-  if (existing) {
+  const matches = await findSavedChannelsMatching(db, input.chat_id, input.username);
+  if (matches.length > 0) {
+    // Prefer the row that already has the exact chat_id so UPDATE never collides with UNIQUE(chat_id)
+    const primary = matches.find((m) => m.chat_id === input.chat_id) ?? matches[0];
+    const duplicatesToRemove = matches.filter((m) => m.id !== primary.id);
+    for (const dup of duplicatesToRemove) {
+      await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(dup.id).run();
+    }
+
+    // Also preserve any custom title set on either the primary or alias row
+    const customTitleRow = matches.find((m) => m.title && m.title !== m.chat_id && m.title !== `@${m.username}`);
     const nextTitle =
-      input.preserveCustomTitle && existing.title && existing.title !== existing.chat_id
-        ? existing.title
-        : input.title || existing.title;
-    const nextUsername = input.username !== undefined ? (input.username ? input.username.replace(/^@/, "") : existing.username) : existing.username;
-    const nextType = input.chat_type ?? existing.chat_type;
+      input.preserveCustomTitle && customTitleRow
+        ? customTitleRow.title
+        : input.title || primary.title;
+    const nextUsername =
+      input.username !== undefined
+        ? input.username
+          ? input.username.replace(/^@/, "")
+          : primary.username
+        : primary.username;
+    const nextType = input.chat_type ?? primary.chat_type;
+
     await db
       .prepare(`UPDATE saved_channels SET chat_id = ?, title = ?, username = ?, chat_type = ? WHERE id = ?`)
-      .bind(input.chat_id, nextTitle, nextUsername ?? null, nextType ?? null, existing.id)
+      .bind(input.chat_id, nextTitle, nextUsername ?? null, nextType ?? null, primary.id)
       .run();
+
     return {
-      ...existing,
+      ...primary,
       chat_id: input.chat_id,
       title: nextTitle,
       username: nextUsername ?? null,
@@ -210,9 +229,9 @@ export async function upsertSavedChannel(
     .bind(id, input.chat_id, title, cleanUsername, input.chat_type ?? null, created_at)
     .run();
 
-  const saved = await findSavedChannelByChatId(db, input.chat_id, cleanUsername);
+  const savedMatches = await findSavedChannelsMatching(db, input.chat_id, cleanUsername);
   return (
-    saved ?? {
+    savedMatches[0] ?? {
       id,
       chat_id: input.chat_id,
       title,
@@ -232,6 +251,15 @@ export async function updateSavedChannel(
   if (!existing) return null;
   const nextTitle = patch.title?.trim() || existing.title;
   const nextChatId = patch.chat_id?.trim() || existing.chat_id;
+
+  // If changing chat_id to one that already exists on another row, remove the other row first to avoid UNIQUE collision
+  if (nextChatId !== existing.chat_id) {
+    await db
+      .prepare(`DELETE FROM saved_channels WHERE LOWER(chat_id) = LOWER(?) AND id != ?`)
+      .bind(nextChatId, id)
+      .run();
+  }
+
   await db
     .prepare(`UPDATE saved_channels SET title = ?, chat_id = ? WHERE id = ?`)
     .bind(nextTitle, nextChatId, id)
@@ -354,7 +382,6 @@ export async function getTask(db: D1Database, id: string): Promise<TaskSummary |
   return row ? rowToTask(row) : null;
 }
 
-/** Single-query joined lookup for task detail view — reduces D1 reads by 50% */
 export async function getTaskWithBot(db: D1Database, id: string): Promise<TaskDetail | null> {
   const row = await db
     .prepare(
@@ -374,7 +401,6 @@ export async function getTaskWithBot(db: D1Database, id: string): Promise<TaskDe
   };
 }
 
-/** Looks up past tasks for a source chat, returning what was done and the latest copied message id */
 export async function listTasksForSourceChat(db: D1Database, chatIds: string[]): Promise<SourceTaskHistory[]> {
   if (chatIds.length === 0) return [];
   const placeholders = chatIds.map(() => "?").join(", ");
@@ -406,7 +432,6 @@ export async function listTasksForSourceChat(db: D1Database, chatIds: string[]):
   });
 }
 
-/** Atomic increment of processed counter for live-forwarded messages */
 export async function incrementTaskProcessed(db: D1Database, taskId: string): Promise<void> {
   await db.prepare(`UPDATE tasks SET processed = processed + 1 WHERE id = ?`).bind(taskId).run();
 }
@@ -977,9 +1002,11 @@ export async function listTasksWithPendingMessages(db: D1Database): Promise<Task
       `SELECT DISTINCT tasks.* FROM tasks
        JOIN task_pending_messages ON task_pending_messages.task_id = tasks.id
        WHERE (tasks.rate_limited_until IS NULL OR tasks.rate_limited_until <= unixepoch())
+         AND (tasks.lease_expires_at IS NULL OR tasks.lease_expires_at < unixepoch())
          AND tasks.live_enabled = 1
          AND tasks.stop_reason IS NULL
-         AND tasks.backfill_status != 'running'`,
+         AND tasks.backfill_status != 'running'
+       ORDER BY tasks.bot_id, tasks.created_at, tasks.id`,
     )
     .all();
   return results.map(rowToTask);

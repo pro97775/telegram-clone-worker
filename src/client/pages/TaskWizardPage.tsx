@@ -55,18 +55,10 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const [loadingBotTasks, setLoadingBotTasks] = useState(false);
   const [showActivityModal, setShowActivityModal] = useState(false);
 
-  // Inline bulk channel add helper (accessible from Step 2 or Step 3)
+  // Inline bulk channel add helper
   const [showInlineChannelAdd, setShowInlineChannelAdd] = useState(false);
   const [inlineChannelText, setInlineChannelText] = useState("");
   const [savingInlineChannels, setSavingInlineChannels] = useState(false);
-
-  function handleClearBot() {
-    setSelectedBotId("");
-    setPendingBot(null);
-    setBotActiveTasks(null);
-    setNewToken("");
-    setBotError(null);
-  }
 
   // Step 2: source chat
   const [sourceChatId, setSourceChatId] = useState("");
@@ -103,6 +95,19 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const runningBackfillTasks = (botActiveTasks ?? []).filter((t) => t.backfill_status === "running");
   const hasRunningBackfill = runningBackfillTasks.length > 0;
 
+  function handleClearBot() {
+    setSelectedBotId("");
+    setPendingBot(null);
+    setBotActiveTasks(null);
+    setNewToken("");
+    setBotError(null);
+    // Clear bot-specific chat lookups so stale permissions from a previous bot are never reused
+    setSourceLookup(null);
+    setSourceError(null);
+    setTargets([]);
+    setBatchDuplicates([]);
+  }
+
   function botQuery(): string {
     if (pendingBot) return `token=${encodeURIComponent(pendingBot.token)}&botTelegramId=${pendingBot.bot_id}`;
     return `botId=${selectedBotId}`;
@@ -114,6 +119,10 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     setBotActiveTasks(null);
     setNewToken("");
     setBotError(null);
+    setSourceLookup(null);
+    setSourceError(null);
+    setTargets([]);
+    setBatchDuplicates([]);
     if (!botId) return;
     setLoadingBotTasks(true);
     const res = await api.get<TaskSummary[]>(`/api/bots/${botId}/tasks`);
@@ -180,6 +189,10 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
       await handleSelectBot(res.data.existing_bot_id);
     } else {
       setSelectedBotId("");
+      setSourceLookup(null);
+      setSourceError(null);
+      setTargets([]);
+      setBatchDuplicates([]);
       setPendingBot({ token: newToken.trim(), bot_id: res.data.bot_id, bot_username: res.data.bot_username });
       setBotActiveTasks(res.data.active_tasks ?? []);
     }
@@ -242,6 +255,18 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     setLookingUpSource(false);
     if (res.ok) {
       setSourceLookup(res.data);
+      // Remove any already-selected target that matches the newly selected source chat
+      const resolvedSrcId = String(res.data.chat.id).toLowerCase();
+      const resolvedSrcUser = res.data.chat.username ? `@${res.data.chat.username.toLowerCase()}` : null;
+      setTargets((prev) =>
+        prev.filter((t) => {
+          const inputNorm = t.inputChatId.toLowerCase();
+          const lookupIdNorm = t.lookup ? String(t.lookup.chat.id).toLowerCase() : null;
+          if (inputNorm === resolvedSrcId || lookupIdNorm === resolvedSrcId) return false;
+          if (resolvedSrcUser && inputNorm === resolvedSrcUser) return false;
+          return true;
+        }),
+      );
       refetchChannels();
     } else {
       setSourceError({ reason: res.reason, description: res.description });
@@ -252,44 +277,48 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     await lookupSourceById(sourceChatId);
   }
 
-  /** Adds and checks one or multiple target chat IDs in parallel */
+  /** Adds and checks one or multiple target chat IDs in parallel (pure state update, safe in React 19 StrictMode) */
   async function addAndLookupTargets(rawChatIds: Array<{ chatId: string; labelHint?: string }>) {
     if (!hasBot || rawChatIds.length === 0) return;
 
-    const sourceIdStr = sourceLookup ? String(sourceLookup.chat.id) : sourceChatId.trim();
-    const filteredNew: TargetItem[] = [];
+    const sourceIdStr = sourceLookup ? String(sourceLookup.chat.id).toLowerCase() : sourceChatId.trim().toLowerCase();
+    const sourceUserStr = sourceLookup?.chat.username ? `@${sourceLookup.chat.username.toLowerCase()}` : "";
 
-    setTargets((prev) => {
-      const existingKeys = new Set(
-        prev.flatMap((t) => [
+    const existingKeys = new Set(
+      targets
+        .flatMap((t) => [
           t.inputChatId.toLowerCase(),
           t.lookup ? String(t.lookup.chat.id).toLowerCase() : "",
           t.lookup?.chat.username ? `@${t.lookup.chat.username.toLowerCase()}` : "",
-        ]).filter(Boolean),
-      );
+        ])
+        .filter(Boolean),
+    );
 
-      for (const item of rawChatIds) {
-        const clean = item.chatId.trim();
-        if (!clean) continue;
-        if (clean === sourceIdStr || (sourceLookup?.chat.username && clean.toLowerCase() === `@${sourceLookup.chat.username.toLowerCase()}`)) {
-          toast.show("error", `Skipped ${clean}: Source and target channel cannot be the same`);
-          continue;
-        }
-        if (existingKeys.has(clean.toLowerCase())) continue;
-        existingKeys.add(clean.toLowerCase());
-        filteredNew.push({
-          key: `${clean}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          inputChatId: clean,
-          labelHint: item.labelHint,
-          loading: true,
-          lookup: null,
-          error: null,
-        });
+    const filteredNew: TargetItem[] = [];
+    for (const item of rawChatIds) {
+      const clean = item.chatId.trim();
+      if (!clean) continue;
+      const cleanLower = clean.toLowerCase();
+      if (cleanLower === sourceIdStr || (sourceUserStr && cleanLower === sourceUserStr)) {
+        toast.show("error", `Skipped ${clean}: Source and target channel cannot be the same`);
+        continue;
       }
-      return [...prev, ...filteredNew];
-    });
+      if (existingKeys.has(cleanLower)) continue;
+      existingKeys.add(cleanLower);
+      filteredNew.push({
+        key: `${clean}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        inputChatId: clean,
+        labelHint: item.labelHint,
+        loading: true,
+        lookup: null,
+        error: null,
+      });
+    }
 
     if (filteredNew.length === 0) return;
+
+    setBatchDuplicates([]);
+    setTargets((prev) => [...prev, ...filteredNew]);
 
     await Promise.all(
       filteredNew.map(async (item) => {
@@ -481,19 +510,20 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     }
 
     const { created, duplicates, errors } = res.data;
-    await refetchGlobalTasks();
-    await refetchChannels();
 
-    if (duplicates.length > 0 && created.length === 0) {
+    if (duplicates.length > 0) {
       setBatchDuplicates(duplicates);
       return;
     }
+
+    await refetchGlobalTasks();
+    await refetchChannels();
 
     if (errors.length > 0) {
       toast.show("error", `${errors.length} target(s) failed: ${errors.map((e) => e.error).join(", ")}`);
     }
 
-    if (created.length === 1 && duplicates.length === 0) {
+    if (created.length === 1) {
       toast.show("success", "Task created");
       navigate(`task/${created[0].id}`);
       return;
@@ -502,9 +532,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     if (created.length > 0) {
       toast.show(
         "success",
-        `Created ${created.length} task${created.length === 1 ? "" : "s"} from ${
-          sourceLookup.chat.title ?? sourceLookup.chat.id
-        }!`,
+        `Created ${created.length} tasks from ${sourceLookup.chat.title ?? sourceLookup.chat.id}!`,
       );
       navigate("");
     }
@@ -546,7 +574,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
         {!hasBot ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            {/* Choose from Existing Saved Bots (Displayed prominently when bots exist) */}
             {bots && bots.length > 0 && (
               <div>
                 <div className="field" style={{ marginBottom: 8 }}>
@@ -575,7 +602,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                   </select>
                 </div>
 
-                {/* Quick-Select Bot Pills */}
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
                   {bots.map((b) => (
                     <button
@@ -610,7 +636,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
               </div>
             )}
 
-            {/* Add Single or Multiple Bot Tokens */}
             <div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -708,7 +733,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
             </div>
           </div>
         ) : (
-          /* Connected Bot summary card */
           <div>
             <div
               style={{
@@ -940,7 +964,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
             </div>
           )}
 
-          {/* Saved Channels Selector (Displayed just like Saved Bots!) */}
           {savedChannels && savedChannels.length > 0 && (
             <div style={{ marginBottom: 14 }}>
               <div className="field" style={{ marginBottom: 8 }}>
@@ -1043,7 +1066,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                 </div>
               )}
 
-              {/* Previous Task History for this Source Channel */}
               {sourceLookup.pastTasks && sourceLookup.pastTasks.length > 0 ? (
                 <div
                   style={{
@@ -1202,7 +1224,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
             )}
           </div>
 
-          {/* Saved Channels Multi-Selector for Targets */}
           {availableTargetChannels.length > 0 && (
             <div style={{ marginBottom: 16 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 6 }}>
@@ -1254,7 +1275,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
             </div>
           )}
 
-          {/* Manual Single or Multi-Target Input */}
           <div className="field">
             <label>Add Target Chat ID(s) or @username(s) (comma-separated or multiple lines)</label>
             <div className="row" style={{ alignItems: "flex-start" }}>
@@ -1276,7 +1296,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
             </div>
           </div>
 
-          {/* Selected Target Channels List */}
           {targets.length > 0 && (
             <div style={{ marginTop: 12, marginBottom: 18 }}>
               <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 8, color: "var(--muted)" }}>
@@ -1404,7 +1423,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                 </div>
               )}
 
-              {/* Message Filters (Available for Live and Live+Backfill) */}
               {scope !== "backfill_only" && (
                 <div
                   style={{

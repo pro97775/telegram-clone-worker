@@ -18,9 +18,6 @@ import {
 } from "../../db/queries";
 import type { BackfillStatus, BatchCreateTasksResult, TaskScope, TaskSummary } from "../../shared/rpcTypes";
 
-/** Sentinel path segment for POST /api/bots/:botId/tasks meaning "the bot
- * behind this task hasn't been saved yet — create it from botToken first."
- * Keeps the wizard from ever persisting a token before a task exists. */
 const NEW_BOT_SENTINEL = "new";
 
 function json(data: unknown, status = 200): Response {
@@ -99,6 +96,13 @@ const DEFAULT_PACING_BATCH_SIZE = 60;
 export async function handleCreateTask(request: Request, env: Env, botId: string, origin: string): Promise<Response> {
   const body = (await request.json()) as CreateTaskBody;
 
+  if (body.sourceChatId.trim().toLowerCase() === body.destChatId.trim().toLowerCase()) {
+    return json(
+      { ok: false, errorCode: 400, description: "Source and destination channel cannot be the same", reason: "invalid_request" },
+      400,
+    );
+  }
+
   let resolvedBotId = botId;
   if (botId === NEW_BOT_SENTINEL) {
     if (!body.botToken) {
@@ -162,7 +166,6 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
       filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
     });
 
-    // Save source & destination channels to saved_channels
     try {
       await upsertSavedChannel(env.DB, {
         chat_id: body.sourceChatId,
@@ -213,7 +216,7 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
 }
 
 /** Creates multiple tasks from 1 source chat through 1 bot to many target chats at once.
- * Resolves the bot (if new) and the source chat's `lastN` range only once across the entire batch!
+ * Pre-validates duplicates across all targets before inserting so partial batches never occur!
  */
 export async function handleCreateBatchTasks(
   request: Request,
@@ -245,6 +248,76 @@ export async function handleCreateBatchTasks(
 
   const wantsBackfill = body.scope === "live_and_backfill" || body.scope === "backfill_only";
   const wantsLive = body.scope === "live" || body.scope === "live_and_backfill";
+
+  if (wantsBackfill && body.backfillMode === "range") {
+    if (body.startId != null && body.endId != null && body.startId > body.endId) {
+      return json(
+        { ok: false, errorCode: 400, description: "startId cannot be greater than endId", reason: "invalid_request" },
+        400,
+      );
+    }
+  }
+
+  // Deduplicate targets and reject self-loops (source == dest)
+  const uniqueTargets: CreateBatchTasksBody["targets"] = [];
+  const seenTargets = new Set<string>();
+  const sourceNorm = body.sourceChatId.trim().toLowerCase();
+
+  for (const target of body.targets) {
+    const destId = target.destChatId?.trim();
+    if (!destId) continue;
+    if (destId.toLowerCase() === sourceNorm) {
+      return json(
+        {
+          ok: false,
+          errorCode: 400,
+          description: `Target channel (${target.destChatTitle ?? destId}) cannot be the same as the source channel`,
+          reason: "invalid_request",
+        },
+        400,
+      );
+    }
+    if (seenTargets.has(destId.toLowerCase())) continue;
+    seenTargets.add(destId.toLowerCase());
+    uniqueTargets.push({ ...target, destChatId: destId });
+  }
+
+  if (uniqueTargets.length === 0) {
+    return json(
+      { ok: false, errorCode: 400, description: "No valid target channels provided", reason: "invalid_request" },
+      400,
+    );
+  }
+
+  // Atomic pre-check for existing duplicate tasks BEFORE running resolveLastN or inserting any rows
+  if (!body.allowDuplicate) {
+    const duplicates: BatchCreateTasksResult["duplicates"] = [];
+    for (const target of uniqueTargets) {
+      const dup = await findDuplicateTask(env.DB, resolvedBotId, body.sourceChatId, target.destChatId);
+      if (dup) {
+        duplicates.push({
+          destChatId: target.destChatId,
+          destChatTitle: target.destChatTitle,
+          existingTask: dup,
+        });
+      }
+    }
+    if (duplicates.length > 0) {
+      return json(
+        {
+          ok: true,
+          data: {
+            bot_id: resolvedBotId,
+            created: [],
+            duplicates,
+            errors: [],
+          } satisfies BatchCreateTasksResult,
+        },
+        200,
+      );
+    }
+  }
+
   const client = new TelegramClient(bot.token);
 
   const result = await toResult(async (): Promise<BatchCreateTasksResult> => {
@@ -257,7 +330,6 @@ export async function handleCreateBatchTasks(
       endId = resolved.endId;
     }
 
-    // Save source channel in saved_channels
     try {
       await upsertSavedChannel(env.DB, {
         chat_id: body.sourceChatId,
@@ -269,27 +341,12 @@ export async function handleCreateBatchTasks(
     }
 
     const created: TaskSummary[] = [];
-    const duplicates: BatchCreateTasksResult["duplicates"] = [];
     const errors: BatchCreateTasksResult["errors"] = [];
     const pacingBatchSize = body.pacingBatchSize ?? DEFAULT_PACING_BATCH_SIZE;
 
-    const seenTargets = new Set<string>();
-    for (const target of body.targets) {
-      const destId = target.destChatId?.trim();
-      if (!destId || seenTargets.has(destId)) continue;
-      seenTargets.add(destId);
-
+    for (const target of uniqueTargets) {
+      const destId = target.destChatId;
       try {
-        const dup = await findDuplicateTask(env.DB, resolvedBotId, body.sourceChatId, destId);
-        if (dup && !body.allowDuplicate) {
-          duplicates.push({
-            destChatId: destId,
-            destChatTitle: target.destChatTitle,
-            existingTask: dup,
-          });
-          continue;
-        }
-
         const id = crypto.randomUUID();
         const label =
           target.label ??
@@ -369,7 +426,7 @@ export async function handleCreateBatchTasks(
     return {
       bot_id: resolvedBotId,
       created,
-      duplicates,
+      duplicates: [],
       errors,
     };
   });

@@ -23,27 +23,36 @@ export async function handleListChannels(env: Env): Promise<Response> {
 }
 
 /** Normalizes raw channel identifier:
- * - https://t.me/channelname -> @channelname
+ * - https://t.me/c/1234567890/45 -> -1001234567890
+ * - https://t.me/channelname/123 -> @channelname
  * - t.me/channelname -> @channelname
  * - -1001234567890 -> -1001234567890
  * - @channelname -> @channelname
  */
-function normalizeChatIdentifier(raw: string): string {
+export function normalizeChatIdentifier(raw: string): string {
   const trimmed = raw.trim();
-  const tmeMatch = trimmed.match(/^(?:https?:\/\/)?t\.me\/([A-Za-z0-9_]{4,64})\/?$/i);
-  if (tmeMatch) {
-    return `@${tmeMatch[1]}`;
+  const privateLinkMatch = trimmed.match(/^(?:https?:\/\/)?t\.me\/c\/(\d{5,20})(?:\/\d+)?\/?$/i);
+  if (privateLinkMatch) {
+    return `-100${privateLinkMatch[1]}`;
+  }
+  const publicLinkMatch = trimmed.match(/^(?:https?:\/\/)?t\.me\/([A-Za-z0-9_]{4,64})(?:\/\d+)?\/?$/i);
+  if (publicLinkMatch && publicLinkMatch[1].toLowerCase() !== "c") {
+    return `@${publicLinkMatch[1]}`;
   }
   return trimmed;
 }
+
+const CHAT_ID_TOKEN_REGEX = /^(-?\d{6,20}|@[A-Za-z0-9_]{3,64}|(?:https?:\/\/)?t\.me\/(?:c\/\d{5,20}|[A-Za-z0-9_]{4,64})(?:\/\d+)?\/?)$/i;
 
 /** Parses multi-line or comma-separated channel entries:
  * Supports formats like:
  *   -1001234567890
  *   @mychannel
  *   https://t.me/mychannel
+ *   https://t.me/c/1234567890/45
  *   My Channel Title | -1001234567890
  *   -1001234567890 | My Channel Title
+ *   -1001234567890 My Channel Title (even if title contains commas!)
  */
 function parseChannelEntries(
   rawText?: string,
@@ -71,8 +80,8 @@ function parseChannelEntries(
       if (line.includes("|")) {
         const parts = line.split("|").map((p) => p.trim()).filter(Boolean);
         if (parts.length >= 2) {
-          const firstIsId = /^(-?\d{6,20}|@[A-Za-z0-9_]+|(?:https?:\/\/)?t\.me\/[A-Za-z0-9_]+)$/i.test(parts[0]);
-          const secondIsId = /^(-?\d{6,20}|@[A-Za-z0-9_]+|(?:https?:\/\/)?t\.me\/[A-Za-z0-9_]+)$/i.test(parts[1]);
+          const firstIsId = CHAT_ID_TOKEN_REGEX.test(parts[0]);
+          const secondIsId = CHAT_ID_TOKEN_REGEX.test(parts[1]);
           const rawId = firstIsId || !secondIsId ? parts[0] : parts[1];
           const rawTitle = firstIsId || !secondIsId ? parts.slice(1).join(" | ") : parts[0];
           const id = normalizeChatIdentifier(rawId);
@@ -84,11 +93,26 @@ function parseChannelEntries(
         }
       }
 
-      // Check if comma-separated IDs on a single line
+      // Check if line is "-1001234567890 My Channel Label" (single ID followed by label, which may contain commas)
+      const leadingIdMatch = line.match(
+        /^(-?\d{6,20}|@[A-Za-z0-9_]{3,64}|(?:https?:\/\/)?t\.me\/(?:c\/\d{5,20}|[A-Za-z0-9_]{4,64})(?:\/\d+)?\/?)\s+[-–—:]?\s*(.+)$/i,
+      );
+      if (leadingIdMatch && !CHAT_ID_TOKEN_REGEX.test(leadingIdMatch[2].split(",")[0].trim())) {
+        const id = normalizeChatIdentifier(leadingIdMatch[1]);
+        const label = leadingIdMatch[2].trim();
+        if (id && !seen.has(id.toLowerCase())) {
+          seen.add(id.toLowerCase());
+          parsed.push({ chatId: id, title: label || undefined });
+        }
+        continue;
+      }
+
+      // Otherwise split by comma (for comma-separated lists of IDs)
       const tokens = line.split(",").map((s) => s.trim()).filter(Boolean);
       for (const tok of tokens) {
-        // Also support "-1001234567890 My Channel Name"
-        const spaceMatch = tok.match(/^(-?\d{6,20}|@[A-Za-z0-9_]+|(?:https?:\/\/)?t\.me\/[A-Za-z0-9_]+)(?:\s+[-–—:]?\s*(.+))?$/i);
+        const spaceMatch = tok.match(
+          /^(-?\d{6,20}|@[A-Za-z0-9_]{3,64}|(?:https?:\/\/)?t\.me\/(?:c\/\d{5,20}|[A-Za-z0-9_]{4,64})(?:\/\d+)?\/?)(?:\s+[-–—:]?\s*(.+))?$/i,
+        );
         if (spaceMatch) {
           const id = normalizeChatIdentifier(spaceMatch[1]);
           const label = spaceMatch[2]?.trim();
@@ -110,11 +134,6 @@ function parseChannelEntries(
   return parsed;
 }
 
-/** Bulk saves channels into saved_channels.
- * If a bot is specified (or any saved bots exist), attempts to resolve the real
- * channel title and canonical ID via Telegram getChat, falling back gracefully
- * to saving the raw chatId + label if no bot is in the channel yet.
- */
 export async function handleBulkSaveChannels(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as {
     rawText?: string;
@@ -136,7 +155,6 @@ export async function handleBulkSaveChannels(request: Request, env: Env): Promis
     );
   }
 
-  // Gather candidate Telegram clients to resolve channel titles automatically
   const clients: TelegramClient[] = [];
   if (body.botToken?.trim()) {
     clients.push(new TelegramClient(body.botToken.trim()));
