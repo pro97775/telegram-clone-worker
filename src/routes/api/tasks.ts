@@ -12,12 +12,15 @@ import {
   listActivityLog,
   listAllTasksSummary,
   listTasksByBot,
+  updateTaskStatus,
   updateTaskConfig,
   deleteTask,
-  upsertSavedChannel,
 } from "../../db/queries";
-import type { BackfillStatus, BatchCreateTasksResult, TaskScope, TaskSummary } from "../../shared/rpcTypes";
+import type { BackfillStatus, TaskScope } from "../../shared/rpcTypes";
 
+/** Sentinel path segment for POST /api/bots/:botId/tasks meaning "the bot
+ * behind this task hasn't been saved yet — create it from botToken first."
+ * Keeps the wizard from ever persisting a token before a task exists. */
 const NEW_BOT_SENTINEL = "new";
 
 function json(data: unknown, status = 200): Response {
@@ -67,41 +70,22 @@ interface CreateTaskBody {
   filterMaxSizeBytes?: number | null;
 }
 
-interface CreateBatchTasksBody {
-  botToken?: string;
-  botLabel?: string;
-  sourceChatId: string;
-  sourceChatTitle?: string;
-  targets: Array<{
-    destChatId: string;
-    destChatTitle?: string;
-    destChatType?: string;
-    label?: string;
-  }>;
-  scope: TaskScope;
-  backfillMode?: "range" | "lastN";
-  startId?: number;
-  endId?: number;
-  n?: number;
-  pacingBatchSize?: number;
-  allowDuplicate?: boolean;
-  saveTemplate?: boolean;
-  filterMediaTypes?: string | null;
-  filterMinSizeBytes?: number | null;
-  filterMaxSizeBytes?: number | null;
-}
-
+/** Evidence-based default from diagnostics testing (channel destination,
+ * copyMessages): 40 and 60 messages/call completed cleanly (~590ms/message
+ * sustained), 80 and 100 both hit a 429 after ~47s, landing at roughly the
+ * same ~79-80-message ceiling regardless of how many were requested beyond
+ * it. 60 is the largest confirmed-clean value. Previously groups defaulted
+ * to a more conservative 20 (Telegram's documented group guidance, never
+ * separately measured) since a rate-limit hit or a single unforwardable
+ * message used to stall a task indefinitely — now that tick.ts pauses and
+ * retries on 429 (see RATE_LIMIT_COOLDOWN_*) and drops a batch instead of
+ * stalling on an unforwardable message, it's safe to use the same number
+ * for every destination and let Telegram's actual responses govern the
+ * real per-bot throughput instead of pre-guessing conservatively by type. */
 const DEFAULT_PACING_BATCH_SIZE = 60;
 
 export async function handleCreateTask(request: Request, env: Env, botId: string, origin: string): Promise<Response> {
   const body = (await request.json()) as CreateTaskBody;
-
-  if (body.sourceChatId.trim().toLowerCase() === body.destChatId.trim().toLowerCase()) {
-    return json(
-      { ok: false, errorCode: 400, description: "Source and destination channel cannot be the same", reason: "invalid_request" },
-      400,
-    );
-  }
 
   let resolvedBotId = botId;
   if (botId === NEW_BOT_SENTINEL) {
@@ -166,23 +150,9 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
       filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
     });
 
-    try {
-      await upsertSavedChannel(env.DB, {
-        chat_id: body.sourceChatId,
-        title: body.sourceChatTitle ?? body.sourceChatId,
-        preserveCustomTitle: true,
-      });
-      await upsertSavedChannel(env.DB, {
-        chat_id: body.destChatId,
-        title: body.destChatTitle ?? body.destChatId,
-        chat_type: body.destChatType ?? null,
-        preserveCustomTitle: true,
-      });
-    } catch {
-      // Non-fatal
-    }
-
     if (body.saveTemplate) {
+      // Best-effort: a saved-template write failure must not fail an
+      // otherwise-successful task creation (no shared transaction here).
       try {
         await insertSavedTask(env.DB, {
           id: crypto.randomUUID(),
@@ -215,225 +185,6 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
   return json(result, result.ok ? 201 : 400);
 }
 
-/** Creates multiple tasks from 1 source chat through 1 bot to many target chats at once.
- * Pre-validates duplicates across all targets before inserting so partial batches never occur!
- */
-export async function handleCreateBatchTasks(
-  request: Request,
-  env: Env,
-  botId: string,
-  origin: string,
-): Promise<Response> {
-  const body = (await request.json()) as CreateBatchTasksBody;
-
-  if (!Array.isArray(body.targets) || body.targets.length === 0) {
-    return json(
-      { ok: false, errorCode: 400, description: "At least one target channel is required", reason: "invalid_request" },
-      400,
-    );
-  }
-
-  let resolvedBotId = botId;
-  if (botId === NEW_BOT_SENTINEL) {
-    if (!body.botToken) {
-      return json({ ok: false, errorCode: 0, description: "botToken is required", reason: "invalid_request" }, 400);
-    }
-    const created = await createBotRecord(env, origin, body.botToken, body.botLabel);
-    if (!created.ok) return json(created, 400);
-    resolvedBotId = created.data.id;
-  }
-
-  const bot = await getBotWithSecrets(env.DB, resolvedBotId);
-  if (!bot) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
-
-  const wantsBackfill = body.scope === "live_and_backfill" || body.scope === "backfill_only";
-  const wantsLive = body.scope === "live" || body.scope === "live_and_backfill";
-
-  if (wantsBackfill && body.backfillMode === "range") {
-    if (body.startId != null && body.endId != null && body.startId > body.endId) {
-      return json(
-        { ok: false, errorCode: 400, description: "startId cannot be greater than endId", reason: "invalid_request" },
-        400,
-      );
-    }
-  }
-
-  // Deduplicate targets and reject self-loops (source == dest)
-  const uniqueTargets: CreateBatchTasksBody["targets"] = [];
-  const seenTargets = new Set<string>();
-  const sourceNorm = body.sourceChatId.trim().toLowerCase();
-
-  for (const target of body.targets) {
-    const destId = target.destChatId?.trim();
-    if (!destId) continue;
-    if (destId.toLowerCase() === sourceNorm) {
-      return json(
-        {
-          ok: false,
-          errorCode: 400,
-          description: `Target channel (${target.destChatTitle ?? destId}) cannot be the same as the source channel`,
-          reason: "invalid_request",
-        },
-        400,
-      );
-    }
-    if (seenTargets.has(destId.toLowerCase())) continue;
-    seenTargets.add(destId.toLowerCase());
-    uniqueTargets.push({ ...target, destChatId: destId });
-  }
-
-  if (uniqueTargets.length === 0) {
-    return json(
-      { ok: false, errorCode: 400, description: "No valid target channels provided", reason: "invalid_request" },
-      400,
-    );
-  }
-
-  // Atomic pre-check for existing duplicate tasks BEFORE running resolveLastN or inserting any rows
-  if (!body.allowDuplicate) {
-    const duplicates: BatchCreateTasksResult["duplicates"] = [];
-    for (const target of uniqueTargets) {
-      const dup = await findDuplicateTask(env.DB, resolvedBotId, body.sourceChatId, target.destChatId);
-      if (dup) {
-        duplicates.push({
-          destChatId: target.destChatId,
-          destChatTitle: target.destChatTitle,
-          existingTask: dup,
-        });
-      }
-    }
-    if (duplicates.length > 0) {
-      return json(
-        {
-          ok: true,
-          data: {
-            bot_id: resolvedBotId,
-            created: [],
-            duplicates,
-            errors: [],
-          } satisfies BatchCreateTasksResult,
-        },
-        200,
-      );
-    }
-  }
-
-  const client = new TelegramClient(bot.token);
-
-  const result = await toResult(async (): Promise<BatchCreateTasksResult> => {
-    let startId = body.startId ?? null;
-    let endId = body.endId ?? null;
-
-    if (wantsBackfill && body.backfillMode === "lastN") {
-      const resolved = await resolveLastN(client, body.sourceChatId, body.n ?? 1);
-      startId = resolved.startId;
-      endId = resolved.endId;
-    }
-
-    try {
-      await upsertSavedChannel(env.DB, {
-        chat_id: body.sourceChatId,
-        title: body.sourceChatTitle ?? body.sourceChatId,
-        preserveCustomTitle: true,
-      });
-    } catch {
-      // ignore
-    }
-
-    const created: TaskSummary[] = [];
-    const errors: BatchCreateTasksResult["errors"] = [];
-    const pacingBatchSize = body.pacingBatchSize ?? DEFAULT_PACING_BATCH_SIZE;
-
-    for (const target of uniqueTargets) {
-      const destId = target.destChatId;
-      try {
-        const id = crypto.randomUUID();
-        const label =
-          target.label ??
-          `${body.sourceChatTitle ?? body.sourceChatId} → ${target.destChatTitle ?? destId}`;
-
-        await insertTask(env.DB, {
-          id,
-          bot_id: resolvedBotId,
-          label,
-          source_chat_id: body.sourceChatId,
-          source_chat_title: body.sourceChatTitle ?? null,
-          dest_chat_id: destId,
-          dest_chat_title: target.destChatTitle ?? null,
-          scope: body.scope,
-          live_enabled: wantsLive,
-          backfill_mode: wantsBackfill ? (body.backfillMode ?? "range") : null,
-          start_id: startId,
-          end_id: endId,
-          cursor: wantsBackfill ? startId : null,
-          total: wantsBackfill && startId !== null && endId !== null ? endId - startId + 1 : null,
-          backfill_status: wantsBackfill ? "running" : "not_applicable",
-          pacing_batch_size: pacingBatchSize,
-          filter_media_types: body.filterMediaTypes ?? null,
-          filter_min_size_bytes: body.filterMinSizeBytes ?? null,
-          filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
-        });
-
-        try {
-          await upsertSavedChannel(env.DB, {
-            chat_id: destId,
-            title: target.destChatTitle ?? destId,
-            chat_type: target.destChatType ?? null,
-            preserveCustomTitle: true,
-          });
-        } catch {
-          // ignore
-        }
-
-        if (body.saveTemplate) {
-          try {
-            await insertSavedTask(env.DB, {
-              id: crypto.randomUUID(),
-              task_id: id,
-              bot_token: bot.token,
-              bot_label: bot.label,
-              bot_username: bot.bot_username,
-              source_chat_id: body.sourceChatId,
-              source_chat_title: body.sourceChatTitle ?? null,
-              dest_chat_id: destId,
-              dest_chat_title: target.destChatTitle ?? null,
-              scope: body.scope,
-              backfill_mode: wantsBackfill ? (body.backfillMode ?? "range") : null,
-              start_id: startId,
-              end_id: endId,
-              n: wantsBackfill && body.backfillMode === "lastN" ? (body.n ?? null) : null,
-              pacing_batch_size: pacingBatchSize,
-              filter_media_types: body.filterMediaTypes ?? null,
-              filter_min_size_bytes: body.filterMinSizeBytes ?? null,
-              filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
-            });
-          } catch (e) {
-            console.error("saved_tasks write failed", e);
-          }
-        }
-
-        const taskRow = await getTask(env.DB, id);
-        if (taskRow) created.push(taskRow);
-      } catch (err) {
-        errors.push({
-          destChatId: destId,
-          destChatTitle: target.destChatTitle,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    return {
-      bot_id: resolvedBotId,
-      created,
-      duplicates: [],
-      errors,
-    };
-  });
-
-  return json(result, result.ok ? 201 : 400);
-}
-
 interface PatchTaskBody {
   label?: string;
   scope?: TaskScope;
@@ -456,6 +207,7 @@ export async function handlePatchTask(request: Request, env: Env, taskId: string
 
   const body = (await request.json()) as PatchTaskBody;
 
+  // Resolve target scope and enablement
   const targetScope = body.scope ?? currentTask.scope;
   let liveEnabled = body.liveEnabled;
   let backfillStatus = body.backfillStatus;
@@ -477,6 +229,7 @@ export async function handlePatchTask(request: Request, env: Env, taskId: string
     }
   }
 
+  // Backfill bounds calculation
   let startId = body.startId !== undefined ? body.startId : currentTask.start_id;
   let endId = body.endId !== undefined ? body.endId : currentTask.end_id;
   let cursor = body.cursor !== undefined ? body.cursor : currentTask.cursor;
@@ -496,9 +249,11 @@ export async function handlePatchTask(request: Request, env: Env, taskId: string
         cursor = startId;
         backfillStatus = "running";
       } else {
+        // If startId increased past current cursor, bump cursor to startId
         if (cursor === null || cursor < startId) {
           cursor = startId;
         }
+        // If endId increased past current cursor and task was complete, resume it
         if (cursor <= endId && (currentTask.backfill_status === "complete" || backfillStatus === "complete")) {
           backfillStatus = "running";
         }
@@ -506,10 +261,12 @@ export async function handlePatchTask(request: Request, env: Env, taskId: string
     }
   }
 
+  // Filter configuration
   let filterMediaTypes = body.filterMediaTypes !== undefined ? body.filterMediaTypes : currentTask.filter_media_types;
   let filterMinSizeBytes = body.filterMinSizeBytes !== undefined ? body.filterMinSizeBytes : currentTask.filter_min_size_bytes;
   let filterMaxSizeBytes = body.filterMaxSizeBytes !== undefined ? body.filterMaxSizeBytes : currentTask.filter_max_size_bytes;
 
+  // Backfill only scope does not use filters
   if (targetScope === "backfill_only") {
     filterMediaTypes = null;
     filterMinSizeBytes = null;

@@ -1,6 +1,7 @@
 import type {
   BackfillStatus,
   BotSummary,
+  ChannelRole,
   ErrorReason,
   SavedChannel,
   SavedTaskSummary,
@@ -31,24 +32,6 @@ export async function insertBot(
     )
     .bind(row.id, row.token, row.bot_id, row.bot_username, row.label, row.webhook_secret)
     .run();
-}
-
-export async function updateExistingBotDetails(
-  db: D1Database,
-  id: string,
-  patch: { token: string; bot_username: string; label?: string },
-): Promise<void> {
-  if (patch.label) {
-    await db
-      .prepare(`UPDATE bots SET token = ?, bot_username = ?, label = ? WHERE id = ?`)
-      .bind(patch.token, patch.bot_username, patch.label, id)
-      .run();
-  } else {
-    await db
-      .prepare(`UPDATE bots SET token = ?, bot_username = ? WHERE id = ?`)
-      .bind(patch.token, patch.bot_username, id)
-      .run();
-  }
 }
 
 export async function listBotsSummary(db: D1Database): Promise<BotSummary[]> {
@@ -122,153 +105,29 @@ export async function updateBotLabel(db: D1Database, id: string, label: string):
   await db.prepare(`UPDATE bots SET label = ? WHERE id = ?`).bind(label, id).run();
 }
 
-export async function deleteBot(db: D1Database, id: string): Promise<void> {
-  await db.prepare(`DELETE FROM bots WHERE id = ?`).bind(id).run();
-}
-
-// Saved Channels
-
-export async function listSavedChannels(db: D1Database): Promise<SavedChannel[]> {
-  const { results } = await db
-    .prepare(`SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels ORDER BY created_at DESC, title ASC`)
-    .all<SavedChannel>();
-  return results;
-}
-
-export async function getSavedChannel(db: D1Database, id: string): Promise<SavedChannel | null> {
-  const row = await db
-    .prepare(`SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels WHERE id = ?`)
-    .bind(id)
-    .first<SavedChannel>();
-  return row ?? null;
-}
-
-export async function findSavedChannelsMatching(
-  db: D1Database,
-  chatId: string,
-  username?: string | null,
-): Promise<SavedChannel[]> {
-  if (username) {
-    const cleanUser = username.replace(/^@/, "").toLowerCase();
-    const { results } = await db
-      .prepare(
-        `SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels
-         WHERE LOWER(chat_id) = LOWER(?) OR LOWER(chat_id) = ? OR LOWER(username) = ?`,
-      )
-      .bind(chatId, `@${cleanUser}`, cleanUser)
-      .all<SavedChannel>();
-    return results;
-  }
-  const { results } = await db
-    .prepare(`SELECT id, chat_id, title, username, chat_type, created_at FROM saved_channels WHERE LOWER(chat_id) = LOWER(?)`)
-    .bind(chatId)
-    .all<SavedChannel>();
-  return results;
-}
-
-export async function upsertSavedChannel(
-  db: D1Database,
-  input: {
-    chat_id: string;
-    title: string;
-    username?: string | null;
-    chat_type?: string | null;
-    preserveCustomTitle?: boolean;
-  },
-): Promise<SavedChannel> {
-  const matches = await findSavedChannelsMatching(db, input.chat_id, input.username);
-  if (matches.length > 0) {
-    // Prefer the row that already has the exact chat_id so UPDATE never collides with UNIQUE(chat_id)
-    const primary = matches.find((m) => m.chat_id === input.chat_id) ?? matches[0];
-    const duplicatesToRemove = matches.filter((m) => m.id !== primary.id);
-    for (const dup of duplicatesToRemove) {
-      await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(dup.id).run();
-    }
-
-    // Also preserve any custom title set on either the primary or alias row
-    const customTitleRow = matches.find((m) => m.title && m.title !== m.chat_id && m.title !== `@${m.username}`);
-    const nextTitle =
-      input.preserveCustomTitle && customTitleRow
-        ? customTitleRow.title
-        : input.title || primary.title;
-    const nextUsername =
-      input.username !== undefined
-        ? input.username
-          ? input.username.replace(/^@/, "")
-          : primary.username
-        : primary.username;
-    const nextType = input.chat_type ?? primary.chat_type;
-
-    await db
-      .prepare(`UPDATE saved_channels SET chat_id = ?, title = ?, username = ?, chat_type = ? WHERE id = ?`)
-      .bind(input.chat_id, nextTitle, nextUsername ?? null, nextType ?? null, primary.id)
-      .run();
-
-    return {
-      ...primary,
-      chat_id: input.chat_id,
-      title: nextTitle,
-      username: nextUsername ?? null,
-      chat_type: nextType ?? null,
-    };
-  }
-
-  const id = crypto.randomUUID();
-  const created_at = Math.floor(Date.now() / 1000);
-  const cleanUsername = input.username ? input.username.replace(/^@/, "") : null;
-  const title = input.title || input.chat_id;
-  await db
-    .prepare(
-      `INSERT INTO saved_channels (id, chat_id, title, username, chat_type, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(chat_id) DO UPDATE SET
-         title = excluded.title,
-         username = COALESCE(excluded.username, saved_channels.username),
-         chat_type = COALESCE(excluded.chat_type, saved_channels.chat_type)`,
-    )
-    .bind(id, input.chat_id, title, cleanUsername, input.chat_type ?? null, created_at)
-    .run();
-
-  const savedMatches = await findSavedChannelsMatching(db, input.chat_id, cleanUsername);
-  return (
-    savedMatches[0] ?? {
-      id,
-      chat_id: input.chat_id,
-      title,
-      username: cleanUsername,
-      chat_type: input.chat_type ?? null,
-      created_at,
-    }
-  );
-}
-
-export async function updateSavedChannel(
+export async function updateBotTokenAndLabel(
   db: D1Database,
   id: string,
-  patch: { title?: string; chat_id?: string },
-): Promise<SavedChannel | null> {
-  const existing = await getSavedChannel(db, id);
-  if (!existing) return null;
-  const nextTitle = patch.title?.trim() || existing.title;
-  const nextChatId = patch.chat_id?.trim() || existing.chat_id;
-
-  // If changing chat_id to one that already exists on another row, remove the other row first to avoid UNIQUE collision
-  if (nextChatId !== existing.chat_id) {
+  token: string,
+  botUsername: string,
+  label?: string,
+): Promise<void> {
+  if (label) {
     await db
-      .prepare(`DELETE FROM saved_channels WHERE LOWER(chat_id) = LOWER(?) AND id != ?`)
-      .bind(nextChatId, id)
+      .prepare(`UPDATE bots SET token = ?, bot_username = ?, label = ? WHERE id = ?`)
+      .bind(token, botUsername, label, id)
+      .run();
+  } else {
+    await db
+      .prepare(`UPDATE bots SET token = ?, bot_username = ? WHERE id = ?`)
+      .bind(token, botUsername, id)
       .run();
   }
-
-  await db
-    .prepare(`UPDATE saved_channels SET title = ?, chat_id = ? WHERE id = ?`)
-    .bind(nextTitle, nextChatId, id)
-    .run();
-  return getSavedChannel(db, id);
 }
 
-export async function deleteSavedChannel(db: D1Database, id: string): Promise<void> {
-  await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(id).run();
+export async function deleteBot(db: D1Database, id: string): Promise<void> {
+  // tasks/task_activity_log/updates cascade via ON DELETE CASCADE
+  await db.prepare(`DELETE FROM bots WHERE id = ?`).bind(id).run();
 }
 
 // Tasks
@@ -382,6 +241,7 @@ export async function getTask(db: D1Database, id: string): Promise<TaskSummary |
   return row ? rowToTask(row) : null;
 }
 
+/** Single-query joined lookup for task detail view — reduces D1 reads by 50% */
 export async function getTaskWithBot(db: D1Database, id: string): Promise<TaskDetail | null> {
   const row = await db
     .prepare(
@@ -401,6 +261,7 @@ export async function getTaskWithBot(db: D1Database, id: string): Promise<TaskDe
   };
 }
 
+/** Looks up past tasks for a source chat, returning what was done and the latest copied message id */
 export async function listTasksForSourceChat(db: D1Database, chatIds: string[]): Promise<SourceTaskHistory[]> {
   if (chatIds.length === 0) return [];
   const placeholders = chatIds.map(() => "?").join(", ");
@@ -432,6 +293,7 @@ export async function listTasksForSourceChat(db: D1Database, chatIds: string[]):
   });
 }
 
+/** Atomic increment of processed counter for live-forwarded messages */
 export async function incrementTaskProcessed(db: D1Database, taskId: string): Promise<void> {
   await db.prepare(`UPDATE tasks SET processed = processed + 1 WHERE id = ?`).bind(taskId).run();
 }
@@ -500,6 +362,8 @@ export async function updateTaskStatus(
     binds.push(patch.backfill_status);
     if (patch.backfill_status === "cancelled") sets.push("stopped_at = unixepoch()");
   }
+  // Resuming a task clears any prior terminal marker so the badge doesn't
+  // keep showing "Stopped"/a stale timestamp after it's active again.
   if (patch.live_enabled === true || patch.backfill_status === "running" || patch.backfill_status === "paused") {
     sets.push("stop_reason = NULL", "stopped_at = NULL");
   }
@@ -586,6 +450,7 @@ export async function updateTaskConfig(
     binds.push(config.filter_max_size_bytes);
   }
 
+  // Clear terminal stop reason if task is set to active
   if (config.live_enabled === true || config.backfill_status === "running" || config.backfill_status === "paused") {
     sets.push("stop_reason = NULL", "stopped_at = NULL");
   }
@@ -595,10 +460,12 @@ export async function updateTaskConfig(
     await db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`).bind(...binds).run();
   }
 
+  // If transitioning away from live or explicitly requested, remove pending live messages
   if (config.clear_pending || config.scope === "backfill_only" || config.live_enabled === false) {
     await db.prepare(`DELETE FROM task_pending_messages WHERE task_id = ?`).bind(id).run();
   }
 }
+
 
 export async function extendTaskEndId(db: D1Database, taskId: string, messageId: number): Promise<void> {
   await db
@@ -685,6 +552,10 @@ export async function deleteTask(db: D1Database, id: string): Promise<void> {
   await db.prepare(`DELETE FROM tasks WHERE id = ?`).bind(id).run();
 }
 
+/** Stops every active task on a bot at once — a revoked/invalid token is
+ * fatal for the whole bot, not just whichever task happened to detect it.
+ * `stop_reason IS NULL` makes this idempotent: safe to call again from a
+ * second task/tick hitting the same dead bot without double-logging. */
 export async function stopTasksForBot(
   db: D1Database,
   botId: string,
@@ -707,6 +578,13 @@ export async function stopTasksForBot(
   return results;
 }
 
+/** Stops a single task — for failures scoped to that task's own chats
+ * (bot kicked from / not admin in the source or dest chat) rather than a
+ * bot-wide problem like a revoked token, so sibling tasks on the same bot
+ * keep running. `stop_reason IS NULL` makes this idempotent, same as
+ * stopTasksForBot. Resuming via updateTaskStatus (PATCH /tasks/:id) clears
+ * stop_reason/stopped_at, so fixing access in Telegram and resuming from
+ * the UI picks the task back up from the same cursor. */
 export async function stopTask(db: D1Database, id: string, reason: ErrorReason): Promise<void> {
   await db
     .prepare(
@@ -721,6 +599,27 @@ export async function stopTask(db: D1Database, id: string, reason: ErrorReason):
     .run();
 }
 
+/** Atomically claims a running task for this invocation of runTick by
+ * stamping a short-lived lease. Cloudflare cron gives no mutual-exclusion
+ * guarantee between scheduled() invocations extended via ctx.waitUntil (see
+ * runTick) — two overlapping invocations can otherwise read the same stale
+ * cursor and call copyMessages with the same range twice. The WHERE guard
+ * only matches when no other invocation currently holds an unexpired lease,
+ * so at most one caller ever gets a non-null row back for a given task at
+ * a time; a stale (expired) lease is claimable again, which is also how a
+ * killed/evicted invocation that never reached its `finally` self-heals.
+ *
+ * The lease is bot-scoped, not just task-scoped: the NOT EXISTS clause also
+ * blocks claiming a task while any *other* task on the same bot_id already
+ * holds an unexpired lease. Without it, two overlapping ticks could each
+ * claim a different task belonging to the same bot and run their
+ * copyMessages calls concurrently — one token, two simultaneous requests,
+ * exactly the burst pauseBotForRateLimit exists to prevent. This is a
+ * single statement, so still atomic, and idx_tasks_bot_id (migrations/
+ * 0001_init.sql) already backs the sibling lookup — no migration needed.
+ * Trade-off: a stranded lease now parks one bot (not one task) for
+ * LEASE_SECONDS; acceptable since all of a bot's tasks share one token and
+ * one quota anyway, and it still self-heals once the lease expires. */
 export async function claimTask(db: D1Database, id: string, leaseSeconds: number): Promise<TaskSummary | null> {
   const row = await db
     .prepare(
@@ -745,6 +644,12 @@ export async function claimTask(db: D1Database, id: string, leaseSeconds: number
   return row ? rowToTask(row) : null;
 }
 
+/** Pauses every active task on a bot (running backfill or live-enabled) for
+ * a short cooldown window after any one of them trips Telegram's rate
+ * limit — back-to-back calls from the same bot are the likely amplifier,
+ * so the whole bot backs off together rather than just the task that hit
+ * the 429. Re-checked by listRunningBackfillTasks/claimTask (backfill) and
+ * the webhook live-forward loop before either makes another Telegram call. */
 export async function pauseBotForRateLimit(db: D1Database, botId: string, until: number): Promise<void> {
   await db
     .prepare(
@@ -794,6 +699,9 @@ export async function getBotRateLimitStats(db: D1Database, botId: string): Promi
   };
 }
 
+/** Releases a task's lease so a still-waiting concurrent tick (or the very
+ * next one) doesn't have to wait out the TTL. Safe to call unconditionally
+ * from a `finally` — a no-op if the task was deleted or never leased. */
 export async function releaseTaskLease(db: D1Database, id: string): Promise<void> {
   await db.prepare(`UPDATE tasks SET lease_expires_at = NULL WHERE id = ?`).bind(id).run();
 }
@@ -820,6 +728,8 @@ export async function listActivityLog(db: D1Database, taskId: string, limit = 50
 
 const ACTIVITY_LOG_KEEP_PER_TASK = 100;
 
+/** Bounds per-task row growth on activity logs — keeps the most recent
+ * ACTIVITY_LOG_KEEP_PER_TASK rows, drops older entries. */
 export async function pruneActivityLog(db: D1Database, taskId: string, keepLimit = ACTIVITY_LOG_KEEP_PER_TASK): Promise<void> {
   await db
     .prepare(
@@ -831,6 +741,7 @@ export async function pruneActivityLog(db: D1Database, taskId: string, keepLimit
     .run();
 }
 
+/** Global activity log garbage collection across all tasks. */
 export async function pruneAllActivityLogs(db: D1Database, keepLimit = ACTIVITY_LOG_KEEP_PER_TASK): Promise<void> {
   await db
     .prepare(
@@ -854,7 +765,10 @@ export async function insertUpdate(db: D1Database, botId: string, updateId: numb
     .run();
 }
 
-// Saved Tasks
+
+
+// Saved Tasks — reusable templates, deliberately decoupled from bots/tasks
+// so they survive deletion of either (see 0008_saved_tasks.sql).
 
 export interface NewSavedTask {
   id: string;
@@ -945,7 +859,7 @@ export async function deleteSavedTask(db: D1Database, id: string): Promise<void>
   await db.prepare(`DELETE FROM saved_tasks WHERE id = ?`).bind(id).run();
 }
 
-// Pending messages queue
+// Pending messages queue (durable failover for rate-limited live messages)
 
 export interface PendingMessageRow {
   id: number;
@@ -1002,12 +916,141 @@ export async function listTasksWithPendingMessages(db: D1Database): Promise<Task
       `SELECT DISTINCT tasks.* FROM tasks
        JOIN task_pending_messages ON task_pending_messages.task_id = tasks.id
        WHERE (tasks.rate_limited_until IS NULL OR tasks.rate_limited_until <= unixepoch())
-         AND (tasks.lease_expires_at IS NULL OR tasks.lease_expires_at < unixepoch())
          AND tasks.live_enabled = 1
          AND tasks.stop_reason IS NULL
-         AND tasks.backfill_status != 'running'
-       ORDER BY tasks.bot_id, tasks.created_at, tasks.id`,
+         AND tasks.backfill_status != 'running'`,
     )
     .all();
   return results.map(rowToTask);
 }
+
+// Saved Channels (Source & Target)
+
+export async function listSavedChannels(db: D1Database, role?: ChannelRole): Promise<SavedChannel[]> {
+  if (role) {
+    const { results } = await db
+      .prepare(
+        `SELECT id, role, chat_id, title, username, label, created_at
+         FROM saved_channels
+         WHERE role = ?
+         ORDER BY created_at DESC`,
+      )
+      .bind(role)
+      .all<SavedChannel>();
+    return results;
+  }
+  const { results } = await db
+    .prepare(
+      `SELECT id, role, chat_id, title, username, label, created_at
+       FROM saved_channels
+       ORDER BY created_at DESC`,
+    )
+    .all<SavedChannel>();
+  return results;
+}
+
+export async function findSavedChannelByRoleAndChatId(
+  db: D1Database,
+  role: ChannelRole,
+  chatIds: string[],
+): Promise<SavedChannel | null> {
+  const valid = chatIds.filter(Boolean).map((c) => c.toLowerCase());
+  if (valid.length === 0) return null;
+  const placeholders = valid.map(() => "?").join(", ");
+  const row = await db
+    .prepare(
+      `SELECT id, role, chat_id, title, username, label, created_at
+       FROM saved_channels
+       WHERE role = ? AND LOWER(chat_id) IN (${placeholders})
+       LIMIT 1`,
+    )
+    .bind(role, ...valid)
+    .first<SavedChannel>();
+  return row ?? null;
+}
+
+export async function insertSavedChannel(
+  db: D1Database,
+  row: {
+    id: string;
+    role: ChannelRole;
+    chat_id: string;
+    title: string | null;
+    username: string | null;
+    label: string;
+  },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO saved_channels (id, role, chat_id, title, username, label)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(row.id, row.role, row.chat_id, row.title, row.username, row.label)
+    .run();
+}
+
+export async function updateSavedChannel(
+  db: D1Database,
+  id: string,
+  patch: { chat_id?: string; title?: string | null; username?: string | null; label?: string },
+): Promise<void> {
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (patch.chat_id !== undefined) {
+    sets.push("chat_id = ?");
+    binds.push(patch.chat_id);
+  }
+  if (patch.title !== undefined) {
+    sets.push("title = ?");
+    binds.push(patch.title);
+  }
+  if (patch.username !== undefined) {
+    sets.push("username = ?");
+    binds.push(patch.username);
+  }
+  if (patch.label !== undefined) {
+    sets.push("label = ?");
+    binds.push(patch.label);
+  }
+  if (sets.length === 0) return;
+  binds.push(id);
+  await db.prepare(`UPDATE saved_channels SET ${sets.join(", ")} WHERE id = ?`).bind(...binds).run();
+}
+
+export async function enrichSavedChannelsByChatId(
+  db: D1Database,
+  lookupIdentifiers: string[],
+  resolvedChatId: string,
+  title?: string,
+  username?: string,
+): Promise<void> {
+  const valid = lookupIdentifiers.filter(Boolean).map((c) => c.toLowerCase());
+  if (valid.length === 0) return;
+  const placeholders = valid.map(() => "?").join(", ");
+  const { results } = await db
+    .prepare(
+      `SELECT id, chat_id, title, username, label
+       FROM saved_channels
+       WHERE LOWER(chat_id) IN (${placeholders})`,
+    )
+    .bind(...valid)
+    .all<SavedChannel>();
+
+  for (const row of results) {
+    const newTitle = title ?? row.title;
+    const newUsername = username ?? row.username;
+    const isDefaultLabel = row.label === row.chat_id || row.label === `@${row.username}`;
+    const newLabel = isDefaultLabel && newTitle ? newTitle : row.label;
+    await updateSavedChannel(db, row.id, {
+      chat_id: resolvedChatId || row.chat_id,
+      title: newTitle,
+      username: newUsername,
+      label: newLabel,
+    });
+  }
+}
+
+export async function deleteSavedChannel(db: D1Database, id: string): Promise<void> {
+  await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(id).run();
+}
+

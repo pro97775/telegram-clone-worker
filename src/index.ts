@@ -1,5 +1,5 @@
 import {
-  handleBulkCreateBots,
+  handleBulkAddBots,
   handleDeleteBot,
   handleDisconnectBotWebhook,
   handleInspectBot,
@@ -9,7 +9,7 @@ import {
   handleVerifyBot,
 } from "./routes/api/bots";
 import {
-  handleBulkSaveChannels,
+  handleBulkCreateChannels,
   handleDeleteChannel,
   handleListChannels,
   handleUpdateChannel,
@@ -26,7 +26,6 @@ import {
   handleUnban,
 } from "./routes/api/chats";
 import {
-  handleCreateBatchTasks,
   handleCreateTask,
   handleDeleteTask,
   handleGetTaskActivity,
@@ -97,12 +96,25 @@ export default {
       // /api/bots
       if (parts[1] === "bots" && parts.length === 2) {
         if (request.method === "GET") return handleListBots(env);
-        if (request.method === "POST") return handleBulkCreateBots(request, env);
+        if (request.method === "POST") return handleBulkAddBots(request, env, url.origin);
       }
 
       // /api/bots/bulk — verify & save multiple bot tokens at once
       if (parts[1] === "bots" && parts[2] === "bulk" && parts.length === 3 && request.method === "POST") {
-        return handleBulkCreateBots(request, env);
+        return handleBulkAddBots(request, env, url.origin);
+      }
+
+      // /api/channels — saved Source & Target channels
+      if (parts[1] === "channels" && parts.length === 2) {
+        if (request.method === "GET") return handleListChannels(env, url.searchParams.get("role") ?? "");
+        if (request.method === "POST") return handleBulkCreateChannels(request, env);
+      }
+      if (parts[1] === "channels" && parts[2] === "bulk" && parts.length === 3 && request.method === "POST") {
+        return handleBulkCreateChannels(request, env);
+      }
+      if (parts[1] === "channels" && parts.length === 3) {
+        if (request.method === "PATCH") return handleUpdateChannel(request, env, parts[2]);
+        if (request.method === "DELETE") return handleDeleteChannel(env, parts[2]);
       }
 
       // /api/bots/sync-webhooks — cleans inactive bot webhooks & tightens allowed_updates
@@ -133,30 +145,12 @@ export default {
         return handleUpdateBot(request, env, parts[2]);
       }
 
-      // /api/channels — saved channels library
-      if (parts[1] === "channels" && parts.length === 2) {
-        if (request.method === "GET") return handleListChannels(env);
-        if (request.method === "POST") return handleBulkSaveChannels(request, env);
-      }
-      if (parts[1] === "channels" && parts[2] === "bulk" && parts.length === 3 && request.method === "POST") {
-        return handleBulkSaveChannels(request, env);
-      }
-      if (parts[1] === "channels" && parts.length === 3) {
-        if (request.method === "PATCH") return handleUpdateChannel(request, env, parts[2]);
-        if (request.method === "DELETE") return handleDeleteChannel(env, parts[2]);
-      }
-
       // /api/bots/:botId/tasks — botId "new" (with a botToken in the body)
       // means the bot isn't saved yet; handleCreateTask saves it as part of
       // creating the task.
       if (parts[1] === "bots" && parts[3] === "tasks" && parts.length === 4) {
         if (request.method === "GET") return handleListTasks(env, parts[2]);
         if (request.method === "POST") return handleCreateTask(request, env, parts[2], url.origin);
-      }
-
-      // /api/bots/:botId/tasks/batch — create multiple tasks from 1 source through 1 bot to many targets
-      if (parts[1] === "bots" && parts[3] === "tasks" && parts[4] === "batch" && parts.length === 5 && request.method === "POST") {
-        return handleCreateBatchTasks(request, env, parts[2], url.origin);
       }
 
       // /api/bots/:botId/tasks/:taskId

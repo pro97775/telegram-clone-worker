@@ -1,12 +1,11 @@
--- Saved Channels library: stores reusable source and target channels/groups
--- so users can select channels from a dropdown/multi-select list just like saved bots.
 CREATE TABLE IF NOT EXISTS saved_channels (
   id TEXT PRIMARY KEY,
-  chat_id TEXT NOT NULL UNIQUE,
-  title TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('source', 'target')),
+  chat_id TEXT NOT NULL,
+  title TEXT,
   username TEXT,
-  chat_type TEXT,
+  label TEXT NOT NULL,
   created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-CREATE INDEX IF NOT EXISTS idx_saved_channels_created_at ON saved_channels(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_saved_channels_role ON saved_channels(role, created_at DESC);

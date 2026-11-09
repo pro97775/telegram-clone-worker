@@ -5,16 +5,15 @@ import { useLayout } from "./LayoutContext";
 import { useTasks, getTaskDisplayInfo } from "../lib/useTasksContext";
 import { useAuth } from "../lib/useAuth";
 import { AuthPage } from "../pages/AuthPage";
-import type { BotSummary, SavedChannel, TaskSummary } from "../../shared/rpcTypes";
+import type { BotSummary, TaskSummary } from "../../shared/rpcTypes";
 
-type Section = "tasks" | "paused" | "completed" | "add" | "bots" | "channels" | "saved" | null;
+type Section = "tasks" | "paused" | "completed" | "add" | "bots" | "saved" | null;
 
 function sectionOf(route: Route): Section {
   if (route.type === "wizard") return "add";
   if (route.type === "paused") return "paused";
   if (route.type === "completed") return "completed";
   if (route.type === "bots") return "bots";
-  if (route.type === "channels") return "channels";
   if (route.type === "saved-tasks") return "saved";
   if (route.type === "empty") return "tasks";
   return null;
@@ -59,14 +58,6 @@ function BotsIcon() {
   );
 }
 
-function ChannelsIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-    </svg>
-  );
-}
-
 function SavedIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -96,20 +87,14 @@ function CollapseIcon() {
 function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [query, setQuery] = useState("");
   const [bots, setBots] = useState<BotSummary[] | null>(null);
-  const [channels, setChannels] = useState<SavedChannel[] | null>(null);
   const [tasks, setTasks] = useState<TaskSummary[] | null>(null);
 
   useEffect(() => {
     if (!open) return;
     setQuery("");
     (async () => {
-      const [botsRes, channelsRes, tasksRes] = await Promise.all([
-        api.get<BotSummary[]>("/api/bots"),
-        api.get<SavedChannel[]>("/api/channels"),
-        listAllTasks(),
-      ]);
+      const [botsRes, tasksRes] = await Promise.all([api.get<BotSummary[]>("/api/bots"), listAllTasks()]);
       setBots(botsRes.ok ? botsRes.data : []);
-      setChannels(channelsRes.ok ? channelsRes.data : []);
       setTasks(tasksRes.ok ? tasksRes.data : []);
     })();
   }, [open]);
@@ -146,26 +131,7 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
         .slice(0, 6),
     [bots, q],
   );
-  const filteredChannels = useMemo(
-    () =>
-      (channels ?? [])
-        .filter(
-          (c) =>
-            !q ||
-            c.title.toLowerCase().includes(q) ||
-            c.chat_id.toLowerCase().includes(q) ||
-            (c.username && c.username.toLowerCase().includes(q)),
-        )
-        .slice(0, 6),
-    [channels, q],
-  );
-  const nothingFound =
-    bots !== null &&
-    tasks !== null &&
-    channels !== null &&
-    filteredTasks.length === 0 &&
-    filteredBots.length === 0 &&
-    filteredChannels.length === 0;
+  const nothingFound = bots !== null && tasks !== null && filteredTasks.length === 0 && filteredBots.length === 0;
 
   if (!open) return null;
 
@@ -187,18 +153,18 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
           <input
             className="input"
             style={{ flex: 1 }}
-            placeholder="Jump to a task, bot, or channel…"
+            placeholder="Jump to a task or bot…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             autoFocus
           />
         </div>
         <div style={{ maxHeight: 260, overflowY: "auto" }}>
-          {bots === null || tasks === null || channels === null ? (
+          {bots === null || tasks === null ? (
             <div className="text-muted" style={{ padding: 12, textAlign: "center" }}>Loading…</div>
           ) : nothingFound ? (
             <div className="text-muted" style={{ padding: 12, textAlign: "center" }}>
-              {q ? `No matches for "${query}"` : "No tasks, bots, or channels found."}
+              {q ? `No matches for "${query}"` : "No tasks or bots found."}
             </div>
           ) : (
             <>
@@ -237,24 +203,6 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
                   </div>
                 </div>
               ))}
-              {filteredChannels.map((c) => (
-                <div
-                  key={c.id}
-                  className="sidebar-nav-item"
-                  style={{ cursor: "pointer", marginBottom: 4 }}
-                  onClick={() => {
-                    navigate("channels");
-                    onClose();
-                  }}
-                >
-                  <div className="sidebar-nav-item-left">
-                    <ChannelsIcon />
-                    <span>
-                      {c.title} ({c.username ? `@${c.username}` : c.chat_id})
-                    </span>
-                  </div>
-                </div>
-              ))}
             </>
           )}
         </div>
@@ -272,6 +220,7 @@ export function AppNav() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const { liveCount: liveTaskCount, pausedCount: pausedTaskCount, completedCount: completedTaskCount } = useTasks();
 
+  // Keyboard shortcut Ctrl/Cmd+K for quick search
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -291,11 +240,13 @@ export function AppNav() {
 
   return (
     <>
+      {/* Backdrop for mobile off-canvas drawer */}
       <div
         className={`drawer-backdrop${drawerOpen ? " is-open" : ""}`}
         onClick={() => setDrawerOpen(false)}
       />
 
+      {/* Retractable Sidebar (Desktop Collapsible + Mobile Off-Canvas Drawer) */}
       <aside
         className={`app-sidebar${sidebarCollapsed ? " is-collapsed" : ""}${drawerOpen ? " drawer-open" : ""}`}
         aria-label="Navigation sidebar"
@@ -379,16 +330,6 @@ export function AppNav() {
           </button>
 
           <button
-            className={`sidebar-nav-item${section === "channels" ? " is-active" : ""}`}
-            onClick={() => handleNav("channels")}
-          >
-            <div className="sidebar-nav-item-left">
-              <ChannelsIcon />
-              <span>Saved Channels</span>
-            </div>
-          </button>
-
-          <button
             className={`sidebar-nav-item${section === "saved" ? " is-active" : ""}`}
             onClick={() => handleNav("saved-tasks")}
           >
@@ -398,6 +339,7 @@ export function AppNav() {
             </div>
           </button>
 
+          {/* Sidebar Credits Card (Positioned directly below Saved Templates on mobile drawer) */}
           <div className="sidebar-credits-card">
             <div className="sidebar-credits-meta">
               <span className="sidebar-credits-meta-label">Author</span>
@@ -444,6 +386,7 @@ export function AppNav() {
             </div>
           </div>
 
+          {/* Authentication Status & Actions */}
           <div className="sidebar-auth-card">
             <div className="sidebar-auth-row">
               <div className={`sidebar-auth-status ${mode === "enforced" ? "is-locked" : "is-open"}`}>
@@ -498,6 +441,7 @@ export function AppNav() {
         </nav>
       </aside>
 
+      {/* Mobile Bottom Navigation Bar (Clean 56px Bar) */}
       <nav className="mobile-tabbar" aria-label="Mobile Navigation">
         <button
           className={`mobile-tab${section === "tasks" ? " active" : ""}`}

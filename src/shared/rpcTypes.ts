@@ -26,45 +26,6 @@ export interface BotSummary {
   created_at: number;
 }
 
-export interface BulkBotImportItemResult {
-  token_preview: string;
-  status: "created" | "existing" | "failed";
-  bot?: BotSummary;
-  error?: string;
-}
-
-export interface BulkBotImportResult {
-  total: number;
-  created: number;
-  existing: number;
-  failed: number;
-  results: BulkBotImportItemResult[];
-}
-
-export interface SavedChannel {
-  id: string;
-  chat_id: string;
-  title: string;
-  username: string | null;
-  chat_type: string | null;
-  created_at: number;
-}
-
-export interface BulkChannelImportItemResult {
-  input: string;
-  status: "saved" | "failed";
-  channel?: SavedChannel;
-  verified_with_telegram?: boolean;
-  error?: string;
-}
-
-export interface BulkChannelImportResult {
-  total: number;
-  saved: number;
-  failed: number;
-  results: BulkChannelImportItemResult[];
-}
-
 export interface BotWebhookDiagnostics {
   is_active: boolean;
   url?: string;
@@ -153,21 +114,6 @@ export interface TaskDetail extends TaskSummary {
   bot_username: string;
 }
 
-export interface BatchCreateTasksResult {
-  bot_id: string;
-  created: TaskSummary[];
-  duplicates: Array<{
-    destChatId: string;
-    destChatTitle?: string;
-    existingTask: TaskSummary;
-  }>;
-  errors: Array<{
-    destChatId: string;
-    destChatTitle?: string;
-    error: string;
-  }>;
-}
-
 export interface CapabilityEntry {
   key: string;
   label: string;
@@ -237,6 +183,30 @@ export interface SavedTaskSummary {
 
 export interface SavedTaskWithToken extends SavedTaskSummary {
   bot_token: string;
+}
+
+// Saved Channels (Source & Target)
+
+export type ChannelRole = "source" | "target";
+
+export interface SavedChannel {
+  id: string;
+  role: ChannelRole;
+  chat_id: string;
+  title: string | null;
+  username: string | null;
+  label: string;
+  created_at: number;
+}
+
+export interface BulkBotsResult {
+  added: BotSummary[];
+  errors: Array<{ tokenPreview: string; error: string }>;
+}
+
+export interface BulkChannelsResult {
+  saved: SavedChannel[];
+  errors: Array<{ input: string; error: string }>;
 }
 
 // Authentication
