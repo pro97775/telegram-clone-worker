@@ -12,18 +12,42 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
   if (bootstrapDone) return;
 
   try {
-    // Ensure app_settings table always exists
-    await db.prepare(`CREATE TABLE IF NOT EXISTS app_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch())
-    )`).run();
+    // Ensure app_settings and saved_channels tables always exist (even on pre-existing deployments)
+    await db.batch([
+      db.prepare(`CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS saved_channels (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        username TEXT,
+        chat_type TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_saved_channels_created_at ON saved_channels(created_at DESC)`),
+    ]);
 
     const existing = await db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
       .first<{ name: string }>();
 
     if (existing) {
+      // Backfill any existing task source/destination channels into saved_channels automatically
+      try {
+        await db.batch([
+          db.prepare(`INSERT OR IGNORE INTO saved_channels (id, chat_id, title, chat_type)
+            SELECT lower(hex(randomblob(16))), source_chat_id, COALESCE(source_chat_title, source_chat_id), 'channel'
+            FROM tasks WHERE source_chat_id IS NOT NULL AND source_chat_id != '' GROUP BY source_chat_id`),
+          db.prepare(`INSERT OR IGNORE INTO saved_channels (id, chat_id, title, chat_type)
+            SELECT lower(hex(randomblob(16))), dest_chat_id, COALESCE(dest_chat_title, dest_chat_id), 'channel'
+            FROM tasks WHERE dest_chat_id IS NOT NULL AND dest_chat_id != '' GROUP BY dest_chat_id`),
+        ]);
+      } catch {
+        // Non-fatal if tasks table is empty or being migrated
+      }
       bootstrapDone = true;
       return;
     }
@@ -33,6 +57,14 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
       db.prepare(`CREATE TABLE IF NOT EXISTS app_settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS saved_channels (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        username TEXT,
+        chat_type TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch())
       )`),
       db.prepare(`CREATE TABLE IF NOT EXISTS bots (
@@ -123,6 +155,7 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
         payload_json TEXT NOT NULL,
         received_at INTEGER NOT NULL DEFAULT (unixepoch())
       )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_saved_channels_created_at ON saved_channels(created_at DESC)`),
       db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_bot_id ON tasks(bot_id)`),
       db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_source_chat ON tasks(bot_id, source_chat_id)`),
       db.prepare(`CREATE INDEX IF NOT EXISTS idx_tasks_backfill_running ON tasks(backfill_status) WHERE backfill_status = 'running'`),

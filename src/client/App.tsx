@@ -10,6 +10,7 @@ import { useHashRoute } from "./lib/router";
 import { TaskWizardPage } from "./pages/TaskWizardPage";
 import { TaskDetailPage } from "./pages/TaskDetailPage";
 import { BotsManagePage } from "./pages/BotsManagePage";
+import { ChannelsManagePage } from "./pages/ChannelsManagePage";
 import { SavedTasksPage } from "./pages/SavedTasksPage";
 import { CompletedTasksPage } from "./pages/CompletedTasksPage";
 import { PausedTasksPage } from "./pages/PausedTasksPage";
@@ -23,6 +24,7 @@ function Page() {
   if (route.type === "paused") return <PausedTasksPage />;
   if (route.type === "completed") return <CompletedTasksPage />;
   if (route.type === "bots") return <BotsManagePage />;
+  if (route.type === "channels") return <ChannelsManagePage />;
   if (route.type === "saved-tasks") return <SavedTasksPage />;
   return <EmptyStatePage />;
 }
@@ -67,12 +69,10 @@ function MainShell() {
     );
   }
 
-  // If password is required and user is not authenticated: render login
   if (mode === "enforced" && !authenticated) {
     return <AuthPage mode="login" />;
   }
 
-  // If in open mode and user has never chosen to skip setup: render setup
   if (mode === "open" && !skippedSetup) {
     return <AuthPage mode="setup" />;
   }

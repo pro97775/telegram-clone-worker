@@ -1,7 +1,7 @@
 import { TelegramClient, type PromoteRights } from "../../telegram/client";
 import { toResult } from "../../telegram/errors";
 import { deriveCapabilities } from "../../telegram/capabilities";
-import { getBotWithSecrets, listTasksForSourceChat } from "../../db/queries";
+import { getBotWithSecrets, listTasksForSourceChat, upsertSavedChannel } from "../../db/queries";
 import { resolveLastN } from "../../jobs/resolveRange";
 import type { ChatLookupResult } from "../../shared/rpcTypes";
 
@@ -43,6 +43,19 @@ export async function handleGetChat(env: Env, chatId: string, botId: string, tok
   const result = await toResult(async (): Promise<ChatLookupResult> => {
     const chat = await client.getChat(chatId);
     const member = await client.getChatMember(chatId, telegramId);
+
+    // Automatically save/update this verified channel in saved_channels so it appears in source/target dropdowns
+    try {
+      await upsertSavedChannel(env.DB, {
+        chat_id: String(chat.id),
+        title: chat.title ?? chat.username ?? String(chat.id),
+        username: chat.username ?? null,
+        chat_type: chat.type,
+        preserveCustomTitle: true,
+      });
+    } catch {
+      // Non-fatal
+    }
 
     let memberCount = undefined;
     try {
@@ -127,9 +140,6 @@ export async function handleSendTestMessage(env: Env, chatId: string, botId: str
   return json(result, result.ok ? 200 : 400);
 }
 
-/** Probe-and-delete trick: send a throwaway message to learn the chat's
- * current highest message id, then best-effort delete it. Deletion
- * failure is non-fatal — it's logged but doesn't fail the lookup. */
 export async function handleLatestMessageId(env: Env, chatId: string, botId: string, token: string): Promise<Response> {
   const client = await loadClient(env, botId, token);
   if (!client) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
@@ -141,9 +151,6 @@ export async function handleLatestMessageId(env: Env, chatId: string, botId: str
   return json(result, result.ok ? 200 : 400);
 }
 
-/** Wizard dry-run: not tied to a saved task yet — resolves the source
- * chat's latest message and copies it to the given destination once, so
- * the user can validate the pipeline before committing. */
 export async function handleAdHocTestCopy(
   env: Env,
   sourceChatId: string,
