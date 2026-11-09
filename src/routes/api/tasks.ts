@@ -48,21 +48,14 @@ export async function handleGetTaskActivity(env: Env, taskId: string): Promise<R
   return json({ ok: true, data: log });
 }
 
-interface DestTargetInput {
-  destChatId: string;
-  destChatTitle?: string;
-  destChatType?: string;
-}
-
 interface CreateTaskBody {
   botToken?: string;
   botLabel?: string;
   sourceChatId: string;
   sourceChatTitle?: string;
-  destChatId?: string;
+  destChatId: string;
   destChatTitle?: string;
   destChatType?: string;
-  destChats?: DestTargetInput[];
   scope: TaskScope;
   backfillMode?: "range" | "lastN";
   startId?: number;
@@ -107,31 +100,12 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
   const bot = await getBotWithSecrets(env.DB, resolvedBotId);
   if (!bot) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
 
-  const targets: DestTargetInput[] =
-    Array.isArray(body.destChats) && body.destChats.length > 0
-      ? body.destChats
-      : body.destChatId
-      ? [{ destChatId: body.destChatId, destChatTitle: body.destChatTitle, destChatType: body.destChatType }]
-      : [];
-
-  if (targets.length === 0) {
-    return json({ ok: false, errorCode: 400, description: "At least one target channel is required", reason: "invalid_request" }, 400);
-  }
-
-  for (const target of targets) {
-    const duplicate = await findDuplicateTask(env.DB, resolvedBotId, body.sourceChatId, target.destChatId);
-    if (duplicate && !body.allowDuplicate) {
-      return json(
-        {
-          ok: false,
-          errorCode: 0,
-          description: `A task for ${body.sourceChatTitle ?? body.sourceChatId} → ${target.destChatTitle ?? target.destChatId} already exists`,
-          reason: "invalid_request",
-          duplicateTaskId: duplicate.id,
-        },
-        409,
-      );
-    }
+  const duplicate = await findDuplicateTask(env.DB, resolvedBotId, body.sourceChatId, body.destChatId);
+  if (duplicate && !body.allowDuplicate) {
+    return json(
+      { ok: false, errorCode: 0, description: "a task with this source and destination already exists", reason: "invalid_request", duplicateTaskId: duplicate.id },
+      409,
+    );
   }
 
   const wantsBackfill = body.scope === "live_and_backfill" || body.scope === "backfill_only";
@@ -149,68 +123,63 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
       endId = resolved.endId;
     }
 
+    const id = crypto.randomUUID();
+    const label =
+      body.label ?? `${body.sourceChatTitle ?? body.sourceChatId} → ${body.destChatTitle ?? body.destChatId}`;
     const pacingBatchSize = body.pacingBatchSize ?? DEFAULT_PACING_BATCH_SIZE;
-    let firstTaskId = "";
 
-    for (const target of targets) {
-      const id = crypto.randomUUID();
-      if (!firstTaskId) firstTaskId = id;
-      const label =
-        body.label ?? `${body.sourceChatTitle ?? body.sourceChatId} → ${target.destChatTitle ?? target.destChatId}`;
+    await insertTask(env.DB, {
+      id,
+      bot_id: resolvedBotId,
+      label,
+      source_chat_id: body.sourceChatId,
+      source_chat_title: body.sourceChatTitle ?? null,
+      dest_chat_id: body.destChatId,
+      dest_chat_title: body.destChatTitle ?? null,
+      scope: body.scope,
+      live_enabled: wantsLive,
+      backfill_mode: wantsBackfill ? (body.backfillMode ?? "range") : null,
+      start_id: startId,
+      end_id: endId,
+      cursor: wantsBackfill ? startId : null,
+      total: wantsBackfill && startId !== null && endId !== null ? endId - startId + 1 : null,
+      backfill_status: wantsBackfill ? "running" : "not_applicable",
+      pacing_batch_size: pacingBatchSize,
+      filter_media_types: body.filterMediaTypes ?? null,
+      filter_min_size_bytes: body.filterMinSizeBytes ?? null,
+      filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
+    });
 
-      await insertTask(env.DB, {
-        id,
-        bot_id: resolvedBotId,
-        label,
-        source_chat_id: body.sourceChatId,
-        source_chat_title: body.sourceChatTitle ?? null,
-        dest_chat_id: target.destChatId,
-        dest_chat_title: target.destChatTitle ?? null,
-        scope: body.scope,
-        live_enabled: wantsLive,
-        backfill_mode: wantsBackfill ? (body.backfillMode ?? "range") : null,
-        start_id: startId,
-        end_id: endId,
-        cursor: wantsBackfill ? startId : null,
-        total: wantsBackfill && startId !== null && endId !== null ? endId - startId + 1 : null,
-        backfill_status: wantsBackfill ? "running" : "not_applicable",
-        pacing_batch_size: pacingBatchSize,
-        filter_media_types: body.filterMediaTypes ?? null,
-        filter_min_size_bytes: body.filterMinSizeBytes ?? null,
-        filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
-      });
-
-      if (body.saveTemplate) {
-        // Best-effort: a saved-template write failure must not fail an
-        // otherwise-successful task creation (no shared transaction here).
-        try {
-          await insertSavedTask(env.DB, {
-            id: crypto.randomUUID(),
-            task_id: id,
-            bot_token: bot.token,
-            bot_label: bot.label,
-            bot_username: bot.bot_username,
-            source_chat_id: body.sourceChatId,
-            source_chat_title: body.sourceChatTitle ?? null,
-            dest_chat_id: target.destChatId,
-            dest_chat_title: target.destChatTitle ?? null,
-            scope: body.scope,
-            backfill_mode: wantsBackfill ? (body.backfillMode ?? "range") : null,
-            start_id: startId,
-            end_id: endId,
-            n: wantsBackfill && body.backfillMode === "lastN" ? (body.n ?? null) : null,
-            pacing_batch_size: pacingBatchSize,
-            filter_media_types: body.filterMediaTypes ?? null,
-            filter_min_size_bytes: body.filterMinSizeBytes ?? null,
-            filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
-          });
-        } catch (e) {
-          console.error("saved_tasks write failed", e);
-        }
+    if (body.saveTemplate) {
+      // Best-effort: a saved-template write failure must not fail an
+      // otherwise-successful task creation (no shared transaction here).
+      try {
+        await insertSavedTask(env.DB, {
+          id: crypto.randomUUID(),
+          task_id: id,
+          bot_token: bot.token,
+          bot_label: bot.label,
+          bot_username: bot.bot_username,
+          source_chat_id: body.sourceChatId,
+          source_chat_title: body.sourceChatTitle ?? null,
+          dest_chat_id: body.destChatId,
+          dest_chat_title: body.destChatTitle ?? null,
+          scope: body.scope,
+          backfill_mode: wantsBackfill ? (body.backfillMode ?? "range") : null,
+          start_id: startId,
+          end_id: endId,
+          n: wantsBackfill && body.backfillMode === "lastN" ? (body.n ?? null) : null,
+          pacing_batch_size: pacingBatchSize,
+          filter_media_types: body.filterMediaTypes ?? null,
+          filter_min_size_bytes: body.filterMinSizeBytes ?? null,
+          filter_max_size_bytes: body.filterMaxSizeBytes ?? null,
+        });
+      } catch (e) {
+        console.error("saved_tasks write failed", e);
       }
     }
 
-    return await getTask(env.DB, firstTaskId);
+    return await getTask(env.DB, id);
   });
 
   return json(result, result.ok ? 201 : 400);
