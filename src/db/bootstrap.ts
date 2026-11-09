@@ -7,19 +7,28 @@
  */
 
 let bootstrapDone = false;
+let savedChannelsVerified = false;
 
-export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
-  if (bootstrapDone) return;
+export async function ensureSavedChannelsTable(db: D1Database): Promise<void> {
+  if (savedChannelsVerified) return;
 
-  try {
-    // Ensure app_settings and saved_channels tables always exist
-    await db.batch([
-      db.prepare(`CREATE TABLE IF NOT EXISTS app_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch())
-      )`),
-      db.prepare(`CREATE TABLE IF NOT EXISTS saved_channels (
+  const { results: cols } = await db
+    .prepare("PRAGMA table_info(saved_channels)")
+    .all<{ name: string }>()
+    .catch(() => ({ results: [] as Array<{ name: string }> }));
+
+  const expectedCols = ["id", "role", "chat_id", "title", "username", "label", "created_at"];
+  const colNames = cols.map((c) => c.name);
+  const schemaMatches =
+    cols.length === expectedCols.length && expectedCols.every((c) => colNames.includes(c));
+
+  if (cols.length > 0 && !schemaMatches) {
+    await db.prepare("DROP TABLE IF EXISTS saved_channels").run();
+  }
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS saved_channels (
         id TEXT PRIMARY KEY,
         role TEXT NOT NULL CHECK (role IN ('source', 'target')),
         chat_id TEXT NOT NULL,
@@ -27,15 +36,54 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
         username TEXT,
         label TEXT NOT NULL,
         created_at INTEGER NOT NULL DEFAULT (unixepoch())
-      )`),
-      db.prepare(`CREATE INDEX IF NOT EXISTS idx_saved_channels_role ON saved_channels(role, created_at DESC)`),
-    ]);
+      )`,
+    )
+    .run();
+
+  await db
+    .prepare(`CREATE INDEX IF NOT EXISTS idx_saved_channels_role ON saved_channels(role, created_at DESC)`)
+    .run();
+
+  savedChannelsVerified = true;
+}
+
+export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
+  try {
+    await ensureSavedChannelsTable(db);
+  } catch (err) {
+    console.error("Failed to ensure saved_channels table:", err);
+  }
+
+  if (bootstrapDone) return;
+
+  try {
+    // Ensure app_settings table always exists
+    await db
+      .prepare(
+        `CREATE TABLE IF NOT EXISTS app_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )`,
+      )
+      .run();
 
     const existing = await db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
       .first<{ name: string }>();
 
     if (existing) {
+      // Ensure bots.last_update_id exists on older databases
+      const { results: botCols } = await db
+        .prepare("PRAGMA table_info(bots)")
+        .all<{ name: string }>()
+        .catch(() => ({ results: [] as Array<{ name: string }> }));
+      if (botCols.length > 0 && !botCols.some((c) => c.name === "last_update_id")) {
+        await db
+          .prepare("ALTER TABLE bots ADD COLUMN last_update_id INTEGER NOT NULL DEFAULT 0")
+          .run()
+          .catch(() => {});
+      }
       bootstrapDone = true;
       return;
     }

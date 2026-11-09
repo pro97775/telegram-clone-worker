@@ -1,4 +1,5 @@
 import { TelegramClient } from "../../telegram/client";
+import { ensureSavedChannelsTable } from "../../db/bootstrap";
 import {
   deleteSavedChannel,
   findSavedChannelByRoleAndChatId,
@@ -43,7 +44,7 @@ export function parseChannelEntries(rawInput: string): Array<{ chatId: string; l
         .split(",")
         .map((p) => p.trim())
         .filter(Boolean);
-      if (commaParts.length > 1 && commaParts.every((p) => isChatIdToken(p.split(/\s+/)[0]))) {
+      if (commaParts.length > 1 && commaParts.every((p) => isChatIdToken(p.split(/\s+/)[0] ?? ""))) {
         for (const part of commaParts) {
           const sub = parseChannelEntries(part);
           for (const item of sub) {
@@ -86,7 +87,7 @@ export function parseChannelEntries(rawInput: string): Array<{ chatId: string; l
         seen.add(key);
         results.push({ chatId, label: remainder || undefined });
       }
-    } else {
+    } else if (spaceTokens.length > 0) {
       // Fallback: treat the first token as chatId and rest as label
       const firstToken = normalizeChatIdentifier(spaceTokens[0]);
       const remainder = line
@@ -105,152 +106,220 @@ export function parseChannelEntries(rawInput: string): Array<{ chatId: string; l
 }
 
 export async function handleListChannels(env: Env, roleParam: string): Promise<Response> {
-  const role = roleParam === "source" || roleParam === "target" ? (roleParam as ChannelRole) : undefined;
-  const channels = await listSavedChannels(env.DB, role);
-  return json({ ok: true, data: channels });
+  try {
+    await ensureSavedChannelsTable(env.DB);
+    const role = roleParam === "source" || roleParam === "target" ? (roleParam as ChannelRole) : undefined;
+    const channels = await listSavedChannels(env.DB, role);
+    return json({ ok: true, data: channels });
+  } catch (err) {
+    return json(
+      {
+        ok: false,
+        errorCode: 500,
+        description: err instanceof Error ? err.message : String(err),
+        reason: "unknown",
+      },
+      500,
+    );
+  }
 }
 
 export async function handleBulkCreateChannels(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json().catch(() => ({}))) as {
-    role?: string;
-    rawInput?: string;
-    channels?: Array<{ chatId: string; label?: string }>;
-    botId?: string;
-    botToken?: string;
-  };
+  try {
+    await ensureSavedChannelsTable(env.DB);
 
-  if (body.role !== "source" && body.role !== "target") {
-    return json(
-      { ok: false, errorCode: 400, description: "role must be 'source' or 'target'", reason: "invalid_request" },
-      400,
-    );
-  }
-  const role: ChannelRole = body.role;
+    const body = (await request.json().catch(() => ({}))) as {
+      role?: string;
+      rawInput?: string;
+      channels?: Array<{ chatId: string; label?: string }>;
+      botId?: string;
+      botToken?: string;
+    };
 
-  const entries =
-    Array.isArray(body.channels) && body.channels.length > 0
-      ? body.channels
-      : parseChannelEntries(body.rawInput ?? "");
-
-  if (entries.length === 0) {
-    return json(
-      { ok: false, errorCode: 400, description: "At least one channel ID or @username is required", reason: "invalid_request" },
-      400,
-    );
-  }
-
-  // Gather candidate bot tokens for best-effort getChat title resolution
-  const candidateTokens: string[] = [];
-  if (body.botToken?.trim()) {
-    candidateTokens.push(body.botToken.trim());
-  }
-  if (body.botId?.trim()) {
-    const specificBot = await getBotWithSecrets(env.DB, body.botId.trim());
-    if (specificBot && !candidateTokens.includes(specificBot.token)) {
-      candidateTokens.push(specificBot.token);
+    if (body.role !== "source" && body.role !== "target") {
+      return json(
+        { ok: false, errorCode: 400, description: "role must be 'source' or 'target'", reason: "invalid_request" },
+        400,
+      );
     }
-  }
-  const allBots = await listBotsWithSecrets(env.DB);
-  for (const b of allBots) {
-    if (candidateTokens.length >= 3) break;
-    if (!candidateTokens.includes(b.token)) {
-      candidateTokens.push(b.token);
+    const role: ChannelRole = body.role;
+
+    const entries =
+      Array.isArray(body.channels) && body.channels.length > 0
+        ? body.channels
+        : parseChannelEntries(body.rawInput ?? "");
+
+    if (entries.length === 0) {
+      return json(
+        {
+          ok: false,
+          errorCode: 400,
+          description: "At least one channel ID or @username is required",
+          reason: "invalid_request",
+        },
+        400,
+      );
     }
-  }
 
-  const saved: SavedChannel[] = [];
-  const errors: Array<{ input: string; error: string }> = [];
-
-  for (const entry of entries) {
-    const rawChatId = entry.chatId.trim();
-    if (!rawChatId) continue;
-
-    let resolvedChatId = rawChatId;
-    let resolvedTitle: string | null = null;
-    let resolvedUsername: string | null = rawChatId.startsWith("@") ? rawChatId.slice(1) : null;
-
-    // Best-effort lookup of chat title/id via available bots
-    for (const token of candidateTokens) {
+    // Gather candidate bot tokens for best-effort getChat title resolution (only when batch is small to stay fast)
+    const candidateTokens: string[] = [];
+    if (entries.length <= 5) {
       try {
-        const client = new TelegramClient(token);
-        const chat = await client.getChat(rawChatId);
-        resolvedChatId = String(chat.id);
-        resolvedTitle = chat.title ?? null;
-        resolvedUsername = chat.username ?? resolvedUsername;
-        break;
+        if (body.botToken?.trim()) {
+          candidateTokens.push(body.botToken.trim());
+        }
+        if (body.botId?.trim()) {
+          const specificBot = await getBotWithSecrets(env.DB, body.botId.trim());
+          if (specificBot && !candidateTokens.includes(specificBot.token)) {
+            candidateTokens.push(specificBot.token);
+          }
+        }
+        if (candidateTokens.length === 0) {
+          const allBots = await listBotsWithSecrets(env.DB);
+          for (const b of allBots) {
+            if (candidateTokens.length >= 2) break;
+            if (b.token && !candidateTokens.includes(b.token)) {
+              candidateTokens.push(b.token);
+            }
+          }
+        }
       } catch {
-        // Ignore if this bot is not in the chat or cannot access it yet
+        // Ignore bot lookup errors — channel saving does not require a bot
       }
     }
 
-    const lookupIds = [
-      rawChatId,
-      resolvedChatId,
-      resolvedUsername ? `@${resolvedUsername}` : "",
-    ].filter(Boolean);
+    const saved: SavedChannel[] = [];
+    const errors: Array<{ input: string; error: string }> = [];
 
-    const existing = await findSavedChannelByRoleAndChatId(env.DB, role, lookupIds);
-    const computedLabel =
-      entry.label?.trim() ||
-      resolvedTitle ||
-      existing?.title ||
-      (resolvedUsername ? `@${resolvedUsername}` : resolvedChatId);
+    for (const entry of entries) {
+      const rawChatId = (entry.chatId ?? "").trim();
+      if (!rawChatId) continue;
 
-    if (existing) {
-      const updatedLabel =
+      let resolvedChatId = rawChatId;
+      let resolvedTitle: string | null = null;
+      let resolvedUsername: string | null = rawChatId.startsWith("@") ? rawChatId.slice(1) : null;
+
+      // Best-effort lookup of chat title/id via available bots
+      for (const token of candidateTokens) {
+        try {
+          const client = new TelegramClient(token);
+          const chat = await client.getChat(rawChatId);
+          resolvedChatId = String(chat.id);
+          resolvedTitle = chat.title ?? null;
+          resolvedUsername = chat.username ?? resolvedUsername;
+          break;
+        } catch {
+          // Ignore if this bot is not in the chat or cannot access it yet
+        }
+      }
+
+      const lookupIds = [
+        rawChatId,
+        resolvedChatId,
+        resolvedUsername ? `@${resolvedUsername}` : "",
+      ].filter(Boolean);
+
+      const existing = await findSavedChannelByRoleAndChatId(env.DB, role, lookupIds);
+      const computedLabel =
         entry.label?.trim() ||
-        (existing.label === existing.chat_id && resolvedTitle ? resolvedTitle : existing.label);
-      await updateSavedChannel(env.DB, existing.id, {
-        chat_id: resolvedChatId,
-        title: resolvedTitle ?? existing.title,
-        username: resolvedUsername ?? existing.username,
-        label: updatedLabel,
-      });
-      saved.push({
-        id: existing.id,
-        role,
-        chat_id: resolvedChatId,
-        title: resolvedTitle ?? existing.title,
-        username: resolvedUsername ?? existing.username,
-        label: updatedLabel,
-        created_at: existing.created_at,
-      });
-    } else {
-      const id = crypto.randomUUID();
-      const createdAt = Math.floor(Date.now() / 1000);
-      await insertSavedChannel(env.DB, {
-        id,
-        role,
-        chat_id: resolvedChatId,
-        title: resolvedTitle,
-        username: resolvedUsername,
-        label: computedLabel,
-      });
-      saved.push({
-        id,
-        role,
-        chat_id: resolvedChatId,
-        title: resolvedTitle,
-        username: resolvedUsername,
-        label: computedLabel,
-        created_at: createdAt,
-      });
-    }
-  }
+        resolvedTitle ||
+        existing?.title ||
+        (resolvedUsername ? `@${resolvedUsername}` : resolvedChatId);
 
-  return json({ ok: true, data: { saved, errors } satisfies BulkChannelsResult });
+      if (existing) {
+        const updatedLabel =
+          entry.label?.trim() ||
+          (existing.label === existing.chat_id && resolvedTitle ? resolvedTitle : existing.label);
+        const nextTitle = resolvedTitle ?? existing.title ?? null;
+        const nextUsername = resolvedUsername ?? existing.username ?? null;
+        await updateSavedChannel(env.DB, existing.id, {
+          chat_id: resolvedChatId,
+          title: nextTitle,
+          username: nextUsername,
+          label: updatedLabel,
+        });
+        saved.push({
+          id: existing.id,
+          role,
+          chat_id: resolvedChatId,
+          title: nextTitle,
+          username: nextUsername,
+          label: updatedLabel,
+          created_at: existing.created_at,
+        });
+      } else {
+        const id = crypto.randomUUID();
+        const createdAt = Math.floor(Date.now() / 1000);
+        await insertSavedChannel(env.DB, {
+          id,
+          role,
+          chat_id: resolvedChatId,
+          title: resolvedTitle ?? null,
+          username: resolvedUsername ?? null,
+          label: computedLabel,
+        });
+        saved.push({
+          id,
+          role,
+          chat_id: resolvedChatId,
+          title: resolvedTitle ?? null,
+          username: resolvedUsername ?? null,
+          label: computedLabel,
+          created_at: createdAt,
+        });
+      }
+    }
+
+    return json({ ok: true, data: { saved, errors } satisfies BulkChannelsResult });
+  } catch (err) {
+    return json(
+      {
+        ok: false,
+        errorCode: 500,
+        description: err instanceof Error ? err.message : String(err),
+        reason: "unknown",
+      },
+      500,
+    );
+  }
 }
 
 export async function handleUpdateChannel(request: Request, env: Env, id: string): Promise<Response> {
-  const body = (await request.json().catch(() => ({}))) as { label?: string };
-  if (!body.label?.trim()) {
-    return json({ ok: false, errorCode: 400, description: "label is required", reason: "invalid_request" }, 400);
+  try {
+    await ensureSavedChannelsTable(env.DB);
+    const body = (await request.json().catch(() => ({}))) as { label?: string };
+    if (!body.label?.trim()) {
+      return json({ ok: false, errorCode: 400, description: "label is required", reason: "invalid_request" }, 400);
+    }
+    await updateSavedChannel(env.DB, id, { label: body.label.trim() });
+    return json({ ok: true, data: null });
+  } catch (err) {
+    return json(
+      {
+        ok: false,
+        errorCode: 500,
+        description: err instanceof Error ? err.message : String(err),
+        reason: "unknown",
+      },
+      500,
+    );
   }
-  await updateSavedChannel(env.DB, id, { label: body.label.trim() });
-  return json({ ok: true, data: null });
 }
 
 export async function handleDeleteChannel(env: Env, id: string): Promise<Response> {
-  await deleteSavedChannel(env.DB, id);
-  return json({ ok: true, data: null });
+  try {
+    await ensureSavedChannelsTable(env.DB);
+    await deleteSavedChannel(env.DB, id);
+    return json({ ok: true, data: null });
+  } catch (err) {
+    return json(
+      {
+        ok: false,
+        errorCode: 500,
+        description: err instanceof Error ? err.message : String(err),
+        reason: "unknown",
+      },
+      500,
+    );
+  }
 }

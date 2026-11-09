@@ -327,49 +327,61 @@ function parseBotTokenInput(rawInput: string): Array<{ token: string; label?: st
 }
 
 export async function handleBulkAddBots(request: Request, env: Env, origin: string): Promise<Response> {
-  const body = (await request.json().catch(() => ({}))) as {
-    rawInput?: string;
-    tokens?: string[];
-  };
+  try {
+    const body = (await request.json().catch(() => ({}))) as {
+      rawInput?: string;
+      tokens?: string[];
+    };
 
-  const combinedInput = body.rawInput ?? (Array.isArray(body.tokens) ? body.tokens.join("\n") : "");
-  const parsed = parseBotTokenInput(combinedInput);
+    const combinedInput = body.rawInput ?? (Array.isArray(body.tokens) ? body.tokens.join("\n") : "");
+    const parsed = parseBotTokenInput(combinedInput);
 
-  if (parsed.length === 0) {
-    return json(
-      { ok: false, errorCode: 400, description: "At least one bot token is required", reason: "invalid_request" },
-      400,
-    );
-  }
-
-  const added: BotSummary[] = [];
-  const errors: Array<{ tokenPreview: string; error: string }> = [];
-
-  for (const item of parsed) {
-    const res = await createBotRecord(env, origin, item.token, item.label);
-    if (res.ok) {
-      added.push(res.data);
-    } else {
-      const preview =
-        item.token.length > 12 ? `${item.token.slice(0, 6)}…${item.token.slice(-4)}` : item.token;
-      errors.push({ tokenPreview: preview, error: res.description });
+    if (parsed.length === 0) {
+      return json(
+        { ok: false, errorCode: 400, description: "At least one bot token is required", reason: "invalid_request" },
+        400,
+      );
     }
-  }
 
-  if (added.length === 0 && errors.length > 0) {
+    const added: BotSummary[] = [];
+    const errors: Array<{ tokenPreview: string; error: string }> = [];
+
+    for (const item of parsed) {
+      const res = await createBotRecord(env, origin, item.token, item.label);
+      if (res.ok) {
+        added.push(res.data);
+      } else {
+        const preview =
+          item.token.length > 12 ? `${item.token.slice(0, 6)}…${item.token.slice(-4)}` : item.token;
+        errors.push({ tokenPreview: preview, error: res.description });
+      }
+    }
+
+    if (added.length === 0 && errors.length > 0) {
+      return json(
+        {
+          ok: false,
+          errorCode: 400,
+          description: errors.map((e) => `${e.tokenPreview}: ${e.error}`).join("; "),
+          reason: "invalid_request",
+          data: { added, errors } satisfies BulkBotsResult,
+        },
+        400,
+      );
+    }
+
+    return json({ ok: true, data: { added, errors } satisfies BulkBotsResult });
+  } catch (err) {
     return json(
       {
         ok: false,
-        errorCode: 400,
-        description: errors.map((e) => `${e.tokenPreview}: ${e.error}`).join("; "),
-        reason: "invalid_request",
-        data: { added, errors } satisfies BulkBotsResult,
+        errorCode: 500,
+        description: err instanceof Error ? err.message : String(err),
+        reason: "unknown",
       },
-      400,
+      500,
     );
   }
-
-  return json({ ok: true, data: { added, errors } satisfies BulkBotsResult });
 }
 
 export async function handleUpdateBot(request: Request, env: Env, id: string): Promise<Response> {

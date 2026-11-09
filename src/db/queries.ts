@@ -985,7 +985,7 @@ export async function insertSavedChannel(
       `INSERT INTO saved_channels (id, role, chat_id, title, username, label)
        VALUES (?, ?, ?, ?, ?, ?)`,
     )
-    .bind(row.id, row.role, row.chat_id, row.title, row.username, row.label)
+    .bind(row.id, row.role, row.chat_id, row.title ?? null, row.username ?? null, row.label)
     .run();
 }
 
@@ -1002,11 +1002,11 @@ export async function updateSavedChannel(
   }
   if (patch.title !== undefined) {
     sets.push("title = ?");
-    binds.push(patch.title);
+    binds.push(patch.title ?? null);
   }
   if (patch.username !== undefined) {
     sets.push("username = ?");
-    binds.push(patch.username);
+    binds.push(patch.username ?? null);
   }
   if (patch.label !== undefined) {
     sets.push("label = ?");
