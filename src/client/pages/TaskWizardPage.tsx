@@ -66,6 +66,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const [destChatId, setDestChatId] = useState("");
   const [savingTargetChannels, setSavingTargetChannels] = useState(false);
   const [destLookup, setDestLookup] = useState<ChatLookupResult | null>(null);
+  const [selectedTargets, setSelectedTargets] = useState<ChatLookupResult[]>([]);
   const [destError, setDestError] = useState<{ reason: ErrorReason; description: string } | null>(null);
   const [lookingUpDest, setLookingUpDest] = useState(false);
   const [scope, setScope] = useState<TaskScope>("live");
@@ -198,19 +199,56 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function lookupDest(overrideChatId?: string) {
-    const targetId = (overrideChatId ?? destChatId).trim();
-    if (!hasBot || !targetId) return;
+    const rawTarget = (overrideChatId ?? destChatId).trim();
+    if (!hasBot || !rawTarget) return;
+    const targetIds = rawTarget
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (targetIds.length === 0) return;
+
     setLookingUpDest(true);
     setDestError(null);
-    setDestLookup(null);
-    const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(targetId)}?${botQuery()}`);
-    setLookingUpDest(false);
-    if (res.ok) {
-      setDestLookup(res.data);
-      refetchChannels();
-    } else {
-      setDestError({ reason: res.reason, description: res.description });
+
+    const newlyResolved: ChatLookupResult[] = [];
+    for (const id of targetIds) {
+      const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(id)}?${botQuery()}`);
+      if (res.ok) {
+        newlyResolved.push(res.data);
+      } else {
+        setDestError({ reason: res.reason, description: `${id}: ${res.description}` });
+      }
     }
+
+    setLookingUpDest(false);
+    if (newlyResolved.length > 0) {
+      setDestLookup(newlyResolved[newlyResolved.length - 1]);
+      setSelectedTargets((prev) => {
+        const next = [...prev];
+        for (const item of newlyResolved) {
+          if (!next.some((existing) => String(existing.chat.id) === String(item.chat.id))) {
+            next.push(item);
+          }
+        }
+        return next;
+      });
+      setDestChatId("");
+      refetchChannels();
+    }
+  }
+
+  function removeSelectedTarget(chatId: number | string) {
+    setSelectedTargets((prev) => {
+      const next = prev.filter((t) => String(t.chat.id) !== String(chatId));
+      setDestLookup(next.length > 0 ? next[next.length - 1] : null);
+      return next;
+    });
+  }
+
+  async function handleSelectAllTargetChannels() {
+    if (!hasBot || targetChannels.length === 0) return;
+    const allIds = targetChannels.map((c) => c.chat_id).join(", ");
+    await lookupDest(allIds);
   }
 
   async function handleSaveSourceChannels() {
@@ -256,12 +294,8 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     const saved = res.data.saved;
     await refetchChannels();
     toast.show("success", `Saved ${saved.length} target channel${saved.length === 1 ? "" : "s"}`);
-    if (saved.length === 1) {
-      setDestChatId(saved[0].chat_id);
-      if (hasBot) await lookupDest(saved[0].chat_id);
-    } else if (saved.length > 1) {
-      setDestChatId(saved[0].chat_id);
-      if (hasBot) await lookupDest(saved[0].chat_id);
+    if (saved.length > 0 && hasBot) {
+      await lookupDest(saved.map((s) => s.chat_id).join(", "));
     }
   }
 
@@ -278,14 +312,11 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function handleSelectTargetChannel(chatId: string) {
-    setDestChatId(chatId);
-    if (!chatId) {
-      setDestLookup(null);
-      setDestError(null);
-      return;
-    }
+    if (!chatId) return;
     if (hasBot) {
       await lookupDest(chatId);
+    } else {
+      setDestChatId(chatId);
     }
   }
 
@@ -346,19 +377,34 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function runTestCopy() {
-    if (!destChatId) return;
+    const activeTargets = selectedTargets.length > 0 ? selectedTargets : destLookup ? [destLookup] : [];
+    if (activeTargets.length === 0) return;
     setTestingCopy(true);
     setTestCopyResult(null);
-    const res = await api.post<{ message_id: number }>(`/api/chats/${encodeURIComponent(sourceChatId)}/test-copy?${botQuery()}`, {
-      destChatId,
-      messageId: testMessageId ? Number(testMessageId) : undefined,
-    });
+    let sentCount = 0;
+    let lastError = "";
+    for (const target of activeTargets) {
+      const res = await api.post<{ message_id: number }>(
+        `/api/chats/${encodeURIComponent(sourceChatId)}/test-copy?${botQuery()}`,
+        {
+          destChatId: String(target.chat.id),
+          messageId: testMessageId ? Number(testMessageId) : undefined,
+        },
+      );
+      if (res.ok) sentCount++;
+      else lastError = res.description;
+    }
     setTestingCopy(false);
-    setTestCopyResult(res.ok ? `Sent as message ${res.data.message_id} in destination` : `Failed: ${res.description}`);
+    setTestCopyResult(
+      sentCount > 0
+        ? `Sent test copy to ${sentCount}/${activeTargets.length} target channel(s)`
+        : `Failed: ${lastError}`,
+    );
   }
 
   async function createTask(allowDuplicate = false, saveTemplate = false) {
-    if (!sourceLookup || !destLookup) return;
+    const activeTargets = selectedTargets.length > 0 ? selectedTargets : destLookup ? [destLookup] : [];
+    if (!sourceLookup || activeTargets.length === 0) return;
     setLastSaveTemplate(saveTemplate);
     setCreating(true);
     setDuplicate(null);
@@ -367,13 +413,19 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     const maxBytes = wantsLive && enableFilters && maxFileSizeMb ? Math.round(Number(maxFileSizeMb) * 1024 * 1024) : undefined;
     const mediaTypesStr = wantsLive && enableFilters && filterMediaTypes.length > 0 ? filterMediaTypes.join(",") : undefined;
 
+    const firstTarget = activeTargets[0];
     const body = {
       botToken: pendingBot?.token,
       sourceChatId: String(sourceLookup.chat.id),
       sourceChatTitle: sourceLookup.chat.title,
-      destChatId: String(destLookup.chat.id),
-      destChatTitle: destLookup.chat.title,
-      destChatType: destLookup.chat.type,
+      destChatId: String(firstTarget.chat.id),
+      destChatTitle: firstTarget.chat.title,
+      destChatType: firstTarget.chat.type,
+      destChats: activeTargets.map((t) => ({
+        destChatId: String(t.chat.id),
+        destChatTitle: t.chat.title,
+        destChatType: t.chat.type,
+      })),
       scope,
       backfillMode: wantsBackfill ? backfillMode : undefined,
       startId: wantsBackfill && backfillMode === "range" ? Number(startId) : undefined,
@@ -389,8 +441,13 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     const res = await api.post<TaskSummary>(`/api/bots/${botPathId}/tasks`, body);
     setCreating(false);
     if (res.ok) {
-      toast.show("success", "Task created");
-      navigate(`task/${res.data.id}`);
+      if (activeTargets.length > 1) {
+        toast.show("success", `Created ${activeTargets.length} tasks from ${sourceLookup.chat.title ?? sourceLookup.chat.id}`);
+        navigate("");
+      } else {
+        toast.show("success", "Task created");
+        navigate(`task/${res.data.id}`);
+      }
       return;
     }
     const duplicateTaskId = (res as { duplicateTaskId?: string }).duplicateTaskId;
@@ -1089,18 +1146,39 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
               </div>
 
               <div className="field" style={{ marginBottom: 0 }}>
-                <label>Select Saved Target Channel</label>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <label style={{ margin: 0 }}>Select Saved Target Channel(s) (pick one or multiple)</label>
+                  {targetChannels.length > 1 && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      disabled={lookingUpDest}
+                      onClick={handleSelectAllTargetChannels}
+                    >
+                      + Select All Target Channels ({targetChannels.length})
+                    </button>
+                  )}
+                </div>
                 <select
                   className="input"
-                  value={targetChannels.some((c) => c.chat_id === destChatId) ? destChatId : ""}
+                  value=""
                   onChange={(e) => handleSelectTargetChannel(e.target.value)}
                 >
-                  <option value="">Choose a previously saved target channel…</option>
-                  {targetChannels.map((c) => (
-                    <option key={c.id} value={c.chat_id}>
-                      {c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}
-                    </option>
-                  ))}
+                  <option value="">Choose a saved target channel to add…</option>
+                  {targetChannels.map((c) => {
+                    const isSelected = selectedTargets.some(
+                      (t) =>
+                        String(t.chat.id) === c.chat_id ||
+                        (t.chat.username && `@${t.chat.username.toLowerCase()}` === c.chat_id.toLowerCase()),
+                    );
+                    return (
+                      <option key={c.id} value={c.chat_id}>
+                        {isSelected ? "✓ " : ""}
+                        {c.label}
+                        {c.label !== c.chat_id ? ` (${c.chat_id})` : ""}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
             </div>
@@ -1108,17 +1186,88 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
           {destError && <PermissionErrorBanner reason={destError.reason} description={destError.description} />}
 
-          {destLookup && (
+          {(selectedTargets.length > 0 || destLookup) && (
             <>
-              <p className="text-muted" style={{ fontSize: 13, marginBottom: 16 }}>
-                <strong>{destLookup.chat.title ?? destLookup.chat.id}</strong> —{" "}
-                {destLookup.capabilities.find((c) => c.key === "send_message")?.available
-                  ? "bot can post here ✓"
-                  : "bot cannot post here ✗"}
-              </p>
+              <div
+                style={{
+                  background: "var(--surface-raised)",
+                  border: "1px solid var(--border-subtle)",
+                  borderRadius: "var(--radius)",
+                  padding: "12px 14px",
+                  marginBottom: 16,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontWeight: 700, fontSize: 13 }}>
+                    📤 Selected Target Channel{selectedTargets.length > 1 ? `s (${selectedTargets.length})` : ""}
+                  </span>
+                  {selectedTargets.length > 1 && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => {
+                        setSelectedTargets([]);
+                        setDestLookup(null);
+                      }}
+                    >
+                      Clear All
+                    </button>
+                  )}
+                </div>
+
+                {selectedTargets.length > 1 && (
+                  <p className="text-muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                    Same content from <strong>{sourceLookup.chat.title ?? sourceLookup.chat.id}</strong> will be forwarded to all{" "}
+                    <strong>{selectedTargets.length}</strong> target channels.
+                  </p>
+                )}
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {(selectedTargets.length > 0 ? selectedTargets : destLookup ? [destLookup] : []).map((target) => {
+                    const canPost = target.capabilities.find((c) => c.key === "send_message")?.available;
+                    return (
+                      <div
+                        key={target.chat.id}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          padding: "8px 10px",
+                          background: "var(--surface)",
+                          border: "1px solid var(--border-subtle)",
+                          borderRadius: "var(--radius-sm)",
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <div>
+                          <strong>{target.chat.title ?? target.chat.id}</strong>{" "}
+                          <span className="text-muted" style={{ fontSize: 11.5 }}>
+                            ({target.chat.id})
+                          </span>{" "}
+                          —{" "}
+                          <span style={{ color: canPost ? "var(--success)" : "var(--danger)", fontWeight: 600 }}>
+                            {canPost ? "bot can post here ✓" : "bot cannot post here ✗"}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          style={{ padding: "2px 8px", fontSize: 11.5 }}
+                          onClick={() => removeSelectedTarget(target.chat.id)}
+                          title="Remove from target channels"
+                        >
+                          ✕ Remove
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
 
               {/* Destination Group Chat Warning for Future Operations */}
-              {(destLookup.chat.type === "group" || destLookup.chat.type === "supergroup") && (
+              {(selectedTargets.some((t) => t.chat.type === "group" || t.chat.type === "supergroup") ||
+                destLookup?.chat.type === "group" ||
+                destLookup?.chat.type === "supergroup") && (
                 <div
                   style={{
                     background: "rgba(56, 189, 248, 0.08)",
@@ -1363,10 +1512,18 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
               <div className="row" style={{ marginTop: 24 }}>
                 <button className="btn btn-primary" disabled={creating} onClick={() => createTask(false, false)}>
-                  {creating && !lastSaveTemplate ? "Creating…" : "Create Task"}
+                  {creating && !lastSaveTemplate
+                    ? "Creating…"
+                    : selectedTargets.length > 1
+                    ? `Create Task (${selectedTargets.length} Targets)`
+                    : "Create Task"}
                 </button>
                 <button className="btn btn-secondary" disabled={creating} onClick={() => createTask(false, true)}>
-                  {creating && lastSaveTemplate ? "Saving…" : "Save & Start"}
+                  {creating && lastSaveTemplate
+                    ? "Saving…"
+                    : selectedTargets.length > 1
+                    ? `Save & Start (${selectedTargets.length} Targets)`
+                    : "Save & Start"}
                 </button>
               </div>
             </>
