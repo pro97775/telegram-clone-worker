@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/usePolling";
 import { useToast } from "../components/Toast";
@@ -49,6 +49,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const [showActivityModal, setShowActivityModal] = useState(false);
 
   function handleClearBot() {
+    invalidateDestLookup();
     setSelectedBotId("");
     setPendingBot(null);
     setBotActiveTasks(null);
@@ -77,6 +78,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const [destError, setDestError] = useState<{ reason: ErrorReason; description: string } | null>(null);
   const [destLookupErrors, setDestLookupErrors] = useState<string[]>([]);
   const [lookingUpDest, setLookingUpDest] = useState(false);
+  const destLookupRequestId = useRef(0);
   const [scope, setScope] = useState<TaskScope>("live");
   const [backfillMode, setBackfillMode] = useState<BackfillMode>("lastN");
   const [startId, setStartId] = useState("");
@@ -110,7 +112,13 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     return `botId=${selectedBotId}`;
   }
 
+  function invalidateDestLookup() {
+    destLookupRequestId.current += 1;
+    setLookingUpDest(false);
+  }
+
   async function handleSelectBot(botId: string) {
+    invalidateDestLookup();
     setSelectedBotId(botId);
     setPendingBot(null);
     setBotActiveTasks(null);
@@ -216,8 +224,12 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function lookupDest(overrideChatId?: string) {
+    const requestId = ++destLookupRequestId.current;
     const targetIds = parseDestinationIds(overrideChatId ?? destChatId);
-    if (!hasBot || targetIds.length === 0) return;
+    if (!hasBot || targetIds.length === 0) {
+      setLookingUpDest(false);
+      return;
+    }
     if (targetIds.length > 25) {
       const description = "Check and create up to 25 destination chats at a time.";
       setLookingUpDest(false);
@@ -235,6 +247,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
       3,
       (targetId) => api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(targetId)}?${botQuery()}`),
     );
+    if (requestId !== destLookupRequestId.current) return;
     setLookingUpDest(false);
     const lookups = results.flatMap((res) => (res.ok ? [res.data] : []));
     const errors = results.flatMap((res, index) =>
@@ -314,6 +327,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     const joinedIds = chatIds.join(", ");
     setDestChatId(joinedIds);
     if (!joinedIds) {
+      invalidateDestLookup();
       setDestLookups([]);
       setDestError(null);
       setDestLookupErrors([]);
@@ -1092,6 +1106,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                       .map((s) => s.trim())
                       .filter(Boolean)
                       .join(", ");
+                    invalidateDestLookup();
                     setDestChatId((prev) => (prev ? `${prev}, ${joined}` : joined));
                     setDestLookups([]);
                     setDestError(null);
@@ -1099,6 +1114,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                   }
                 }}
                 onChange={(e) => {
+                  invalidateDestLookup();
                   setDestChatId(e.target.value);
                   setDestLookups([]);
                   setDestError(null);
@@ -1148,11 +1164,10 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                 <label>Select Saved Target Channels</label>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   {targetChannels.map((c) => (
-                    <label key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: lookingUpDest ? "default" : "pointer" }}>
+                    <label key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
                       <input
                         type="checkbox"
                         checked={destinationIds.includes(c.chat_id)}
-                        disabled={lookingUpDest}
                         onChange={() => {
                           const nextIds = destinationIds.includes(c.chat_id)
                             ? destinationIds.filter((id) => id !== c.chat_id)
