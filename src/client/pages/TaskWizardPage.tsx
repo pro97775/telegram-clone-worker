@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/usePolling";
 import { useToast } from "../components/Toast";
@@ -8,7 +8,6 @@ import { PermissionErrorBanner } from "../components/PermissionErrorBanner";
 import { BotActivityModal } from "../components/BotActivityModal";
 import { navigate } from "../lib/router";
 import { getTaskDisplayInfo } from "../lib/useTasksContext";
-import { runWithConcurrency } from "../../shared/concurrencyPool";
 import type {
   BotSummary,
   BulkBotsResult,
@@ -22,10 +21,6 @@ import type {
 } from "../../shared/rpcTypes";
 
 type BackfillMode = "range" | "lastN";
-
-function parseDestinationIds(value: string): string[] {
-  return [...new Set(value.split(/[\s,;]+/).map((id) => id.trim()).filter(Boolean))];
-}
 
 export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const toast = useToast();
@@ -49,15 +44,11 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const [showActivityModal, setShowActivityModal] = useState(false);
 
   function handleClearBot() {
-    invalidateDestLookup();
     setSelectedBotId("");
     setPendingBot(null);
     setBotActiveTasks(null);
     setNewToken("");
     setBotError(null);
-    setDestLookups([]);
-    setDestError(null);
-    setDestLookupErrors([]);
   }
 
   // Step 2: source chat
@@ -74,11 +65,9 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   // Step 3: destination + config
   const [destChatId, setDestChatId] = useState("");
   const [savingTargetChannels, setSavingTargetChannels] = useState(false);
-  const [destLookups, setDestLookups] = useState<ChatLookupResult[]>([]);
+  const [destLookup, setDestLookup] = useState<ChatLookupResult | null>(null);
   const [destError, setDestError] = useState<{ reason: ErrorReason; description: string } | null>(null);
-  const [destLookupErrors, setDestLookupErrors] = useState<string[]>([]);
   const [lookingUpDest, setLookingUpDest] = useState(false);
-  const destLookupRequestId = useRef(0);
   const [scope, setScope] = useState<TaskScope>("live");
   const [backfillMode, setBackfillMode] = useState<BackfillMode>("lastN");
   const [startId, setStartId] = useState("");
@@ -98,12 +87,6 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const selectedBot = bots?.find((b) => b.id === selectedBotId);
   const hasBot = !!selectedBotId || !!pendingBot;
   const wantsBackfill = scope === "live_and_backfill" || scope === "backfill_only";
-  const destinationIds = parseDestinationIds(destChatId);
-  const destinationChecksComplete =
-    destinationIds.length > 0 &&
-    destinationIds.length <= 25 &&
-    destLookups.length === destinationIds.length &&
-    destLookupErrors.length === 0;
   const runningBackfillTasks = (botActiveTasks ?? []).filter((t) => t.backfill_status === "running");
   const hasRunningBackfill = runningBackfillTasks.length > 0;
 
@@ -112,21 +95,12 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     return `botId=${selectedBotId}`;
   }
 
-  function invalidateDestLookup() {
-    destLookupRequestId.current += 1;
-    setLookingUpDest(false);
-  }
-
   async function handleSelectBot(botId: string) {
-    invalidateDestLookup();
     setSelectedBotId(botId);
     setPendingBot(null);
     setBotActiveTasks(null);
     setNewToken("");
     setBotError(null);
-    setDestLookups([]);
-    setDestError(null);
-    setDestLookupErrors([]);
     if (!botId) return;
     setLoadingBotTasks(true);
     const res = await api.get<TaskSummary[]>(`/api/bots/${botId}/tasks`);
@@ -224,40 +198,18 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function lookupDest(overrideChatId?: string) {
-    const requestId = ++destLookupRequestId.current;
-    const targetIds = parseDestinationIds(overrideChatId ?? destChatId);
-    if (!hasBot || targetIds.length === 0) {
-      setLookingUpDest(false);
-      return;
-    }
-    if (targetIds.length > 25) {
-      const description = "Check and create up to 25 destination chats at a time.";
-      setLookingUpDest(false);
-      setDestLookups([]);
-      setDestLookupErrors([description]);
-      setDestError({ reason: "invalid_request", description });
-      return;
-    }
+    const targetId = (overrideChatId ?? destChatId).trim();
+    if (!hasBot || !targetId) return;
     setLookingUpDest(true);
     setDestError(null);
-    setDestLookups([]);
-    setDestLookupErrors([]);
-    const results = await runWithConcurrency(
-      targetIds,
-      3,
-      (targetId) => api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(targetId)}?${botQuery()}`),
-    );
-    if (requestId !== destLookupRequestId.current) return;
+    setDestLookup(null);
+    const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(targetId)}?${botQuery()}`);
     setLookingUpDest(false);
-    const lookups = results.flatMap((res) => (res.ok ? [res.data] : []));
-    const errors = results.flatMap((res, index) =>
-      res.ok ? [] : [{ reason: res.reason, description: `${targetIds[index]}: ${res.description}` }],
-    );
-    setDestLookups(lookups);
-    setDestLookupErrors(errors.map((error) => error.description));
-    setDestError(errors[0] ?? null);
-    if (lookups.length > 0) {
+    if (res.ok) {
+      setDestLookup(res.data);
       refetchChannels();
+    } else {
+      setDestError({ reason: res.reason, description: res.description });
     }
   }
 
@@ -304,10 +256,12 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     const saved = res.data.saved;
     await refetchChannels();
     toast.show("success", `Saved ${saved.length} target channel${saved.length === 1 ? "" : "s"}`);
-    if (saved.length > 0) {
-      const savedIds = saved.map((channel) => channel.chat_id);
-      setDestChatId(savedIds.join(", "));
-      if (hasBot) await lookupDest(savedIds.join(", "));
+    if (saved.length === 1) {
+      setDestChatId(saved[0].chat_id);
+      if (hasBot) await lookupDest(saved[0].chat_id);
+    } else if (saved.length > 1) {
+      setDestChatId(saved[0].chat_id);
+      if (hasBot) await lookupDest(saved[0].chat_id);
     }
   }
 
@@ -323,18 +277,15 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     }
   }
 
-  async function handleSelectTargetChannels(chatIds: string[]) {
-    const joinedIds = chatIds.join(", ");
-    setDestChatId(joinedIds);
-    if (!joinedIds) {
-      invalidateDestLookup();
-      setDestLookups([]);
+  async function handleSelectTargetChannel(chatId: string) {
+    setDestChatId(chatId);
+    if (!chatId) {
+      setDestLookup(null);
       setDestError(null);
-      setDestLookupErrors([]);
       return;
     }
     if (hasBot) {
-      await lookupDest(joinedIds);
+      await lookupDest(chatId);
     }
   }
 
@@ -395,12 +346,11 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function runTestCopy() {
-    const targetId = String(destLookups[0]?.chat.id ?? destinationIds[0] ?? "");
-    if (!targetId) return;
+    if (!destChatId) return;
     setTestingCopy(true);
     setTestCopyResult(null);
     const res = await api.post<{ message_id: number }>(`/api/chats/${encodeURIComponent(sourceChatId)}/test-copy?${botQuery()}`, {
-      destChatId: targetId,
+      destChatId,
       messageId: testMessageId ? Number(testMessageId) : undefined,
     });
     setTestingCopy(false);
@@ -408,7 +358,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   }
 
   async function createTask(allowDuplicate = false, saveTemplate = false) {
-    if (!sourceLookup || !destinationChecksComplete) return;
+    if (!sourceLookup || !destLookup) return;
     setLastSaveTemplate(saveTemplate);
     setCreating(true);
     setDuplicate(null);
@@ -417,19 +367,13 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     const maxBytes = wantsLive && enableFilters && maxFileSizeMb ? Math.round(Number(maxFileSizeMb) * 1024 * 1024) : undefined;
     const mediaTypesStr = wantsLive && enableFilters && filterMediaTypes.length > 0 ? filterMediaTypes.join(",") : undefined;
 
-    const destinations = destLookups.map((lookup) => ({
-      chatId: String(lookup.chat.id),
-      title: lookup.chat.title,
-      type: lookup.chat.type,
-    }));
     const body = {
       botToken: pendingBot?.token,
       sourceChatId: String(sourceLookup.chat.id),
       sourceChatTitle: sourceLookup.chat.title,
-      destChatId: destinations[0].chatId,
-      destChatTitle: destinations[0].title,
-      destChatType: destinations[0].type,
-      destinations,
+      destChatId: String(destLookup.chat.id),
+      destChatTitle: destLookup.chat.title,
+      destChatType: destLookup.chat.type,
       scope,
       backfillMode: wantsBackfill ? backfillMode : undefined,
       startId: wantsBackfill && backfillMode === "range" ? Number(startId) : undefined,
@@ -442,11 +386,11 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
       filterMaxSizeBytes: maxBytes,
     };
     const botPathId = pendingBot ? "new" : selectedBotId;
-    const res = await api.post<TaskSummary[]>(`/api/bots/${botPathId}/tasks`, body);
+    const res = await api.post<TaskSummary>(`/api/bots/${botPathId}/tasks`, body);
     setCreating(false);
     if (res.ok) {
-      toast.show("success", `${res.data.length} destination task${res.data.length === 1 ? "" : "s"} created`);
-      navigate(`task/${res.data[0].id}`);
+      toast.show("success", "Task created");
+      navigate(`task/${res.data.id}`);
       return;
     }
     const duplicateTaskId = (res as { duplicateTaskId?: string }).duplicateTaskId;
@@ -1077,8 +1021,8 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
         <div className="card">
           <div className="card-header">
             <div className="card-title">
-              <span className={`step-pill ${destinationChecksComplete ? "done" : "active"}`}>
-                {destinationChecksComplete ? "✓" : "3"}
+              <span className={`step-pill ${destLookup ? "done" : "active"}`}>
+                {destLookup ? "✓" : "3"}
               </span>
               <span>3. Destination & Sync Mode</span>
             </div>
@@ -1086,17 +1030,12 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
           <div className="field">
             <label>Destination / Target Chat ID or @username (paste one or multiple to save)</label>
-            {destinationIds.length > 25 && (
-              <p className="text-muted" style={{ fontSize: 12, margin: "0 0 8px" }}>
-                Check and create at most 25 destination chats at a time.
-              </p>
-            )}
             <div className="row">
               <input
                 className="input"
                 style={{ flex: 1 }}
-                disabled={lookingUpDest}
                 value={destChatId}
+                onChange={(e) => setDestChatId(e.target.value)}
                 onPaste={(e) => {
                   const text = e.clipboardData.getData("text");
                   if (text.includes("\n")) {
@@ -1106,19 +1045,8 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                       .map((s) => s.trim())
                       .filter(Boolean)
                       .join(", ");
-                    invalidateDestLookup();
                     setDestChatId((prev) => (prev ? `${prev}, ${joined}` : joined));
-                    setDestLookups([]);
-                    setDestError(null);
-                    setDestLookupErrors([]);
                   }
-                }}
-                onChange={(e) => {
-                  invalidateDestLookup();
-                  setDestChatId(e.target.value);
-                  setDestLookups([]);
-                  setDestError(null);
-                  setDestLookupErrors([]);
                 }}
                 placeholder="e.g. -1009876543210 or @destchannel (comma-separated for multiple)"
               />
@@ -1161,50 +1089,37 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
               </div>
 
               <div className="field" style={{ marginBottom: 0 }}>
-                <label>Select Saved Target Channels</label>
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <label>Select Saved Target Channel</label>
+                <select
+                  className="input"
+                  value={targetChannels.some((c) => c.chat_id === destChatId) ? destChatId : ""}
+                  onChange={(e) => handleSelectTargetChannel(e.target.value)}
+                >
+                  <option value="">Choose a previously saved target channel…</option>
                   {targetChannels.map((c) => (
-                    <label key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={destinationIds.includes(c.chat_id)}
-                        onChange={() => {
-                          const nextIds = destinationIds.includes(c.chat_id)
-                            ? destinationIds.filter((id) => id !== c.chat_id)
-                            : [...destinationIds, c.chat_id];
-                          void handleSelectTargetChannels(nextIds);
-                        }}
-                      />
-                      <span>{c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}</span>
-                    </label>
+                    <option key={c.id} value={c.chat_id}>
+                      {c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}
+                    </option>
                   ))}
-                </div>
+                </select>
               </div>
             </div>
           )}
 
           {destError && <PermissionErrorBanner reason={destError.reason} description={destError.description} />}
-          {destLookupErrors.length > 0 && (
-            <ul className="text-muted" style={{ fontSize: 12, margin: "8px 0 14px", paddingLeft: 20 }}>
-              {destLookupErrors.map((error) => <li key={error}>{error}</li>)}
-            </ul>
-          )}
 
-          {destLookups.length > 0 && (
+          {destLookup && (
             <>
-              {destLookups.map((lookup) => (
-                <p key={lookup.chat.id} className="text-muted" style={{ fontSize: 13, marginBottom: 8 }}>
-                  <strong>{lookup.chat.title ?? lookup.chat.id}</strong> —{" "}
-                  {lookup.capabilities.find((c) => c.key === "send_message")?.available
-                    ? "bot can post here ✓"
-                    : "bot cannot post here ✗"}
-                </p>
-              ))}
+              <p className="text-muted" style={{ fontSize: 13, marginBottom: 16 }}>
+                <strong>{destLookup.chat.title ?? destLookup.chat.id}</strong> —{" "}
+                {destLookup.capabilities.find((c) => c.key === "send_message")?.available
+                  ? "bot can post here ✓"
+                  : "bot cannot post here ✗"}
+              </p>
 
               {/* Destination Group Chat Warning for Future Operations */}
-              {destLookups.filter((lookup) => lookup.chat.type === "group" || lookup.chat.type === "supergroup").map((lookup) => (
+              {(destLookup.chat.type === "group" || destLookup.chat.type === "supergroup") && (
                 <div
-                  key={lookup.chat.id}
                   style={{
                     background: "rgba(56, 189, 248, 0.08)",
                     border: "1px solid rgba(56, 189, 248, 0.3)",
@@ -1216,7 +1131,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                   <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
                     <span style={{ fontSize: 18, marginTop: 1 }}>ℹ️</span>
                     <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
-                      <strong style={{ color: "var(--info)" }}>{lookup.chat.title ?? lookup.chat.id} is a Group Chat:</strong>
+                      <strong style={{ color: "var(--info)" }}>Destination is a Group Chat:</strong>
                       <p style={{ margin: "4px 0 6px", color: "var(--ink)" }}>
                         Messages copied here will be sent under this bot's identity. <strong>Notice for future operations:</strong> Telegram's anti-loop rule prevents bots from copying messages sent by other bots in groups. If you or another bot ever attempt to clone messages <em>out</em> of this destination group later, those bot-authored messages will not be copyable.
                       </p>
@@ -1226,7 +1141,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                     </div>
                   </div>
                 </div>
-              ))}
+              )}
 
               <div className="field">
                 <label>Copy Scope</label>
@@ -1416,7 +1331,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                 <input
                   className="input"
                   style={{ maxWidth: 180 }}
-                  placeholder="Message ID (optional; first target)"
+                  placeholder="Message ID (optional)"
                   value={testMessageId}
                   onChange={(e) => setTestMessageId(e.target.value)}
                 />
@@ -1447,10 +1362,10 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
               )}
 
               <div className="row" style={{ marginTop: 24 }}>
-                <button className="btn btn-primary" disabled={creating || !destinationChecksComplete} onClick={() => createTask(false, false)}>
+                <button className="btn btn-primary" disabled={creating} onClick={() => createTask(false, false)}>
                   {creating && !lastSaveTemplate ? "Creating…" : "Create Task"}
                 </button>
-                <button className="btn btn-secondary" disabled={creating || !destinationChecksComplete} onClick={() => createTask(false, true)}>
+                <button className="btn btn-secondary" disabled={creating} onClick={() => createTask(false, true)}>
                   {creating && lastSaveTemplate ? "Saving…" : "Save & Start"}
                 </button>
               </div>

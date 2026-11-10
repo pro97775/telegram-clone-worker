@@ -188,8 +188,8 @@ export interface NewTask {
   filter_max_size_bytes?: number | null;
 }
 
-function insertTaskStatement(db: D1Database, t: NewTask): D1PreparedStatement {
-  return db
+export async function insertTask(db: D1Database, t: NewTask): Promise<void> {
+  await db
     .prepare(
       `INSERT INTO tasks (
         id, bot_id, label, source_chat_id, source_chat_title, dest_chat_id, dest_chat_title,
@@ -217,16 +217,8 @@ function insertTaskStatement(db: D1Database, t: NewTask): D1PreparedStatement {
       t.filter_media_types ?? null,
       t.filter_min_size_bytes ?? null,
       t.filter_max_size_bytes ?? null,
-    );
-}
-
-export async function insertTasks(db: D1Database, tasks: NewTask[]): Promise<void> {
-  if (tasks.length === 0) return;
-  await db.batch(tasks.map((task) => insertTaskStatement(db, task)));
-}
-
-export async function insertTask(db: D1Database, task: NewTask): Promise<void> {
-  await insertTasks(db, [task]);
+    )
+    .run();
 }
 
 export async function listTasksByBot(db: D1Database, botId: string): Promise<TaskSummary[]> {
@@ -488,53 +480,53 @@ export async function extendTaskEndId(db: D1Database, taskId: string, messageId:
     .run();
 }
 
-/** Records one finished backfill batch. Counters are applied as deltas, and the cursor only
- * moves if it still holds the value the batch started from — a batch can take ~45s, and a
- * PATCH in that window (reset progress, range or cursor edit) must not be overwritten by the
- * batch's stale snapshot. `applied` is false when that guard skipped the update. */
 export async function advanceTaskProgress(
   db: D1Database,
   id: string,
-  batch: { fromCursor: number; toCursor: number; processedDelta: number; failedDelta: number },
-): Promise<{ applied: boolean; complete: boolean }> {
+  patch: {
+    cursor: number;
+    processed: number;
+    failed: number;
+    live_processed?: number;
+    live_failed?: number;
+    backfill_status?: BackfillStatus;
+  },
+): Promise<{ backfill_status: BackfillStatus; complete: boolean }> {
   const row = await db
     .prepare(
       `UPDATE tasks
-       SET cursor = ?1,
-           processed = processed + ?2,
-           failed = failed + ?3,
+       SET cursor = ?,
+           processed = ?,
+           failed = ?,
+           live_processed = COALESCE(?, live_processed),
+           live_failed = COALESCE(?, live_failed),
            backfill_status = CASE
-             WHEN end_id IS NOT NULL AND ?1 > end_id AND backfill_status IN ('running', 'paused') THEN 'complete'
+             WHEN ? = 'complete' OR (end_id IS NOT NULL AND ? > end_id) THEN 'complete'
              ELSE backfill_status
            END,
            stopped_at = CASE
-             WHEN end_id IS NOT NULL AND ?1 > end_id AND backfill_status IN ('running', 'paused') AND live_enabled = 0
-               THEN unixepoch()
+             WHEN (? = 'complete' OR (end_id IS NOT NULL AND ? > end_id)) AND live_enabled = 0 THEN unixepoch()
              ELSE stopped_at
            END
-       WHERE id = ?4 AND cursor = ?5
-       RETURNING backfill_status`,
+       WHERE id = ?
+       RETURNING backfill_status, end_id`,
     )
-    .bind(batch.toCursor, batch.processedDelta, batch.failedDelta, id, batch.fromCursor)
-    .first<{ backfill_status: BackfillStatus }>();
-
-  return { applied: row !== null, complete: row?.backfill_status === "complete" };
-}
-
-/** Settles a running backfill whose cursor is already past end_id (e.g. after the range was
- * shortened). Returns whether the task was actually updated. */
-export async function markBackfillComplete(db: D1Database, id: string): Promise<boolean> {
-  const result = await db
-    .prepare(
-      `UPDATE tasks
-       SET backfill_status = 'complete',
-           stopped_at = CASE WHEN live_enabled = 0 THEN unixepoch() ELSE stopped_at END
-       WHERE id = ? AND backfill_status = 'running'
-         AND cursor IS NOT NULL AND end_id IS NOT NULL AND cursor > end_id`,
+    .bind(
+      patch.cursor,
+      patch.processed,
+      patch.failed,
+      patch.live_processed ?? null,
+      patch.live_failed ?? null,
+      patch.backfill_status ?? null,
+      patch.cursor,
+      patch.backfill_status ?? null,
+      patch.cursor,
+      id,
     )
-    .bind(id)
-    .run();
-  return (result.meta?.changes ?? 0) > 0;
+    .first<{ backfill_status: BackfillStatus; end_id: number | null }>();
+
+  const isComplete = row?.backfill_status === "complete";
+  return { backfill_status: row?.backfill_status ?? "running", complete: isComplete };
 }
 
 export async function incrementLiveCounters(
@@ -607,16 +599,6 @@ export async function stopTask(db: D1Database, id: string, reason: ErrorReason):
     .run();
 }
 
-/** What a lease is taken for: copying a backfill batch, or polling/delivering live messages.
- * Each only admits tasks that are active for that kind of work, so a paused or cancelled
- * backfill can't be picked up just because the same task's live side is still enabled. */
-export type LeasePurpose = "backfill" | "live";
-
-const LEASE_ELIGIBILITY: Record<LeasePurpose, string> = {
-  backfill: "backfill_status = 'running'",
-  live: "live_enabled = 1",
-};
-
 /** Atomically claims a running task for this invocation of runTick by
  * stamping a short-lived lease. Cloudflare cron gives no mutual-exclusion
  * guarantee between scheduled() invocations extended via ctx.waitUntil (see
@@ -638,18 +620,13 @@ const LEASE_ELIGIBILITY: Record<LeasePurpose, string> = {
  * Trade-off: a stranded lease now parks one bot (not one task) for
  * LEASE_SECONDS; acceptable since all of a bot's tasks share one token and
  * one quota anyway, and it still self-heals once the lease expires. */
-export async function claimTask(
-  db: D1Database,
-  id: string,
-  leaseSeconds: number,
-  purpose: LeasePurpose,
-): Promise<TaskSummary | null> {
+export async function claimTask(db: D1Database, id: string, leaseSeconds: number): Promise<TaskSummary | null> {
   const row = await db
     .prepare(
       `UPDATE tasks
        SET lease_expires_at = unixepoch() + ?
        WHERE id = ?
-         AND ${LEASE_ELIGIBILITY[purpose]}
+         AND (backfill_status = 'running' OR live_enabled = 1)
          AND stop_reason IS NULL
          AND (lease_expires_at IS NULL OR lease_expires_at < unixepoch())
          AND (rate_limited_until IS NULL OR rate_limited_until <= unixepoch())
@@ -743,7 +720,7 @@ export async function appendActivityLog(
 
 export async function listActivityLog(db: D1Database, taskId: string, limit = 50) {
   const { results } = await db
-    .prepare(`SELECT * FROM task_activity_log WHERE task_id = ? ORDER BY at DESC, id DESC LIMIT ?`)
+    .prepare(`SELECT * FROM task_activity_log WHERE task_id = ? ORDER BY at DESC LIMIT ?`)
     .bind(taskId, limit)
     .all();
   return results;
@@ -757,7 +734,7 @@ export async function pruneActivityLog(db: D1Database, taskId: string, keepLimit
   await db
     .prepare(
       `DELETE FROM task_activity_log WHERE task_id = ? AND id NOT IN (
-         SELECT id FROM task_activity_log WHERE task_id = ? ORDER BY id DESC LIMIT ?
+         SELECT id FROM task_activity_log WHERE task_id = ? ORDER BY at DESC LIMIT ?
        )`,
     )
     .bind(taskId, taskId, keepLimit)
@@ -933,12 +910,18 @@ export async function deletePendingMessages(db: D1Database, ids: number[]): Prom
   await db.prepare(`DELETE FROM task_pending_messages WHERE id IN (${placeholders})`).bind(...ids).run();
 }
 
-export async function hasPendingMessages(db: D1Database, taskId: string): Promise<boolean> {
-  const row = await db
-    .prepare(`SELECT 1 AS found FROM task_pending_messages WHERE task_id = ? LIMIT 1`)
-    .bind(taskId)
-    .first<{ found: number }>();
-  return row !== null;
+export async function listTasksWithPendingMessages(db: D1Database): Promise<TaskSummary[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT tasks.* FROM tasks
+       JOIN task_pending_messages ON task_pending_messages.task_id = tasks.id
+       WHERE (tasks.rate_limited_until IS NULL OR tasks.rate_limited_until <= unixepoch())
+         AND tasks.live_enabled = 1
+         AND tasks.stop_reason IS NULL
+         AND tasks.backfill_status != 'running'`,
+    )
+    .all();
+  return results.map(rowToTask);
 }
 
 // Saved Channels (Source & Target)
@@ -1070,3 +1053,4 @@ export async function enrichSavedChannelsByChatId(
 export async function deleteSavedChannel(db: D1Database, id: string): Promise<void> {
   await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(id).run();
 }
+
