@@ -21,12 +21,21 @@ function classify(body: TelegramApiErrorBody): ErrorReason {
   const desc = body.description.toLowerCase();
   if (body.error_code === 429 || desc.includes("too many requests")) return "rate_limited";
   if (body.error_code === 401) return "unauthorized";
-  if (body.error_code === 403 || desc.includes("bot was kicked") || desc.includes("bot is not a member")) {
+  // Bots get "chat not found" for any chat they can't see, which in practice means they were
+  // never added or have since been removed — retrying won't fix it.
+  if (
+    body.error_code === 403 ||
+    desc.includes("bot was kicked") ||
+    desc.includes("bot is not a member") ||
+    desc.includes("chat not found")
+  ) {
     return "bot_not_in_chat";
   }
   if (
     desc.includes("not enough rights") ||
     desc.includes("chat_admin_required") ||
+    desc.includes("administrator rights") ||
+    desc.includes("chat_write_forbidden") ||
     desc.includes("have no rights") ||
     desc.includes("can't remove chat owner") ||
     desc.includes("user_not_participant")

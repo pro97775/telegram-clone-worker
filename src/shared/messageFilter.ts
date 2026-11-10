@@ -21,6 +21,48 @@ export interface FilterEvaluation {
   reason?: string;
 }
 
+// Service messages (pins, title/photo changes, member joins, …) arrive in the same update
+// stream as real posts, but bots can never copy them.
+const SERVICE_MESSAGE_FIELDS = [
+  "new_chat_members",
+  "left_chat_member",
+  "new_chat_title",
+  "new_chat_photo",
+  "delete_chat_photo",
+  "group_chat_created",
+  "supergroup_chat_created",
+  "channel_chat_created",
+  "message_auto_delete_timer_changed",
+  "migrate_to_chat_id",
+  "migrate_from_chat_id",
+  "pinned_message",
+  "boost_added",
+  "chat_background_set",
+  "forum_topic_created",
+  "forum_topic_edited",
+  "forum_topic_closed",
+  "forum_topic_reopened",
+  "general_forum_topic_hidden",
+  "general_forum_topic_unhidden",
+  "giveaway_created",
+  "giveaway_completed",
+  "video_chat_scheduled",
+  "video_chat_started",
+  "video_chat_ended",
+  "video_chat_participants_invited",
+  "write_access_allowed",
+  "proximity_alert_triggered",
+  "users_shared",
+  "chat_shared",
+  "successful_payment",
+  "refunded_payment",
+];
+
+export function isServiceMessage(msg: TelegramMessage): boolean {
+  const fields = msg as unknown as Record<string, unknown>;
+  return SERVICE_MESSAGE_FIELDS.some((field) => fields[field] !== undefined);
+}
+
 /** Extracts standardized media type, file size, and file name from a TelegramMessage. */
 export function extractMessageMetadata(msg: TelegramMessage): ExtractedMetadata {
   if (msg.document) {

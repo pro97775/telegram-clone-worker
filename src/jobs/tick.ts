@@ -1,17 +1,18 @@
 import { TelegramClient } from "../telegram/client";
 import { TelegramApiError } from "../telegram/errors";
+import type { TelegramMessage } from "../telegram/types";
 import {
   advanceTaskProgress,
   appendActivityLog,
   claimTask,
   deletePendingMessages,
-  extendTaskEndId,
   getBotWithSecrets,
+  hasPendingMessages,
   incrementLiveCounters,
   insertPendingMessage,
   listActiveSyncTasks,
   listPendingMessages,
-  listTasksWithPendingMessages,
+  markBackfillComplete,
   pauseBotForRateLimit,
   pruneActivityLog,
   releaseTaskLease,
@@ -27,6 +28,7 @@ import {
   extractMessageMetadata,
   formatBytes,
   getMediaIcon,
+  isServiceMessage,
 } from "../shared/messageFilter";
 
 // Cloudflare: "Each Worker invocation can have up to six connections
@@ -63,6 +65,35 @@ const LEASE_SECONDS = 240;
 export const RATE_LIMIT_COOLDOWN_MIN_SECONDS = 60;
 export const RATE_LIMIT_COOLDOWN_MAX_SECONDS = 120;
 
+// getUpdates pages pulled per bot per tick (100 updates each).
+const MAX_PULL_PAGES = 5;
+
+// Telegram keeps undelivered updates for up to 24h, so the first poll after a live task is
+// created can return posts from before it existed. Those are skipped; the grace window covers
+// the gap between the "last N" probe and the task insert, plus clock skew.
+const LIVE_BACKLOG_GRACE_SECONDS = 5;
+
+// Queued live messages delivered per task per tick (one copyMessage call each).
+const MAX_PENDING_DRAIN_PER_TICK = 60;
+
+// Pruning runs a subquery DELETE, so it's sampled instead of run after every log write.
+const ACTIVITY_PRUNE_SAMPLE_RATE = 0.05;
+
+type ActivityKind = "live_forward" | "backfill_batch";
+
+interface WorkOutcome {
+  /** The bot was rate-limited or its token is dead — skip its remaining work this tick. */
+  haltBot: boolean;
+}
+
+interface BatchOutcome extends WorkOutcome {
+  backfillComplete: boolean;
+}
+
+interface DrainOutcome extends WorkOutcome {
+  delivered: number;
+}
+
 export async function runTick(env: Env): Promise<void> {
   const tickStartedAtMs = Date.now();
   const tasks = await listActiveSyncTasks(env.DB);
@@ -91,6 +122,7 @@ export async function runTick(env: Env): Promise<void> {
   }
 
   let batchesRun = 0;
+  let liveDelivered = 0;
   await runWithConcurrency(groups, MAX_CONCURRENT_BOTS, async (groupTasks) => {
     // In Round-Robin mode, honor the time budget to avoid overlapping next cron
     if (!isSmoothMode && Date.now() - tickStartedAtMs > MAX_TICK_WALL_TIME_MS) {
@@ -103,250 +135,323 @@ export async function runTick(env: Env): Promise<void> {
       if (!bot) return;
       const client = new TelegramClient(bot.token);
 
-      // 1. Pull-based Auto-Sync: Check for new Telegram updates if any task has live_enabled = 1
-      const hasLive = groupTasks.some((t) => t.live_enabled);
-      if (hasLive) {
-        try {
-          const MAX_PULL_PAGES = 5;
-          let page = 0;
-          let currentOffset = bot.last_update_id > 0 ? bot.last_update_id + 1 : undefined;
-          let maxUpdateId = bot.last_update_id;
+      // 1. Pull new posts into each matching live task's pending queue.
+      const poll = await pollLiveUpdates(env, bot, client, groupTasks);
+      if (poll.haltBot) return;
 
-          while (page < MAX_PULL_PAGES) {
-            page++;
-            const updates = await client.getUpdates({
-              offset: currentOffset,
-              limit: 100,
-              allowed_updates: ["channel_post"],
-            });
-            if (!updates || updates.length === 0) break;
-
-            for (const update of updates) {
-              if (update.update_id > maxUpdateId) maxUpdateId = update.update_id;
-              const post = update.channel_post;
-              if (!post) continue;
-              const chatStr = String(post.chat.id);
-              const matchingTasks = groupTasks.filter((t) => t.source_chat_id === chatStr && t.live_enabled);
-              if (matchingTasks.length === 0) continue;
-
-              const meta = extractMessageMetadata(post);
-              const icon = getMediaIcon(meta.type);
-              const sizeStr = meta.size ? formatBytes(meta.size) : "";
-              const fileDesc = [icon, sizeStr, meta.name ? `(${meta.name})` : ""].filter(Boolean).join(" ");
-
-              for (const t of matchingTasks) {
-                if (t.cursor === null && t.backfill_status === "not_applicable") {
-                  t.cursor = post.message_id;
-                }
-
-                // Parse filter criteria
-                const filterMediaTypes = t.filter_media_types
-                  ? t.filter_media_types.split(",").map((s) => s.trim()).filter(Boolean)
-                  : undefined;
-                const evalResult = evaluateMessageFilter(post, {
-                  mediaTypes: filterMediaTypes,
-                  minSizeBytes: t.filter_min_size_bytes,
-                  maxSizeBytes: t.filter_max_size_bytes,
-                });
-
-                if (!evalResult.matched) {
-                  // Filtered out / skipped
-                  await incrementLiveCounters(env.DB, t.id, 0, 0, 1);
-                  t.live_skipped = (t.live_skipped ?? 0) + 1;
-                  await appendActivityLog(env.DB, {
-                    task_id: t.id,
-                    kind: "live_forward",
-                    detail: `${fileDesc} · msg #${post.message_id} skipped: ${evalResult.reason}`,
-                    ok: false,
-                    error: `Filtered: ${evalResult.reason}`,
-                  });
-                  continue;
-                }
-
-                // Matched filter! Buffer into task_pending_messages
-                await insertPendingMessage(
-                  env.DB,
-                  t.id,
-                  post.message_id,
-                  meta.type,
-                  meta.size ?? null,
-                  meta.name ?? null,
-                );
-
-                if (t.backfill_status === "running") {
-                  await appendActivityLog(env.DB, {
-                    task_id: t.id,
-                    kind: "live_forward",
-                    detail: `⏳ Queued in buffer: ${fileDesc} · msg #${post.message_id} (waiting for backfill to finish)`,
-                    ok: true,
-                  });
-                }
-              }
-            }
-
-            currentOffset = maxUpdateId + 1;
-            if (updates.length < 100) break;
-          }
-
-          if (maxUpdateId > bot.last_update_id) {
-            await updateBotLastUpdateId(env.DB, bot.id, maxUpdateId);
-            bot.last_update_id = maxUpdateId;
-          }
-        } catch (e) {
-          if (e instanceof TelegramApiError) {
-            if (e.errorCode === 401 || e.reason === "unauthorized") {
-              console.warn(`tick: bot ${bot.bot_username} unauthorized (401), stopping live tasks.`);
-              const stoppedTasks = await stopTasksForBot(env.DB, bot.id, "unauthorized");
-              for (const st of stoppedTasks) {
-                await appendActivityLog(env.DB, {
-                  task_id: st.id,
-                  kind: "live_forward",
-                  detail: "Stopped: Bot token unauthorized (401). Bot token may have been revoked or changed in @BotFather.",
-                  ok: false,
-                  error: "401 Unauthorized",
-                });
-              }
-              return;
-            }
-            if (e.errorCode === 409 || (typeof e.message === "string" && e.message.toLowerCase().includes("webhook"))) {
-              console.warn(`tick: webhook conflict detected for bot ${bot.bot_username}, attempting deleteWebhook to restore getUpdates.`);
-              try {
-                await client.deleteWebhook();
-              } catch (delErr) {
-                console.error(`tick: failed to deleteWebhook for bot ${bot.bot_username}:`, delErr);
-              }
-              return;
-            }
-          }
-          console.error(`tick: getUpdates failed for bot ${bot.bot_username}`, e);
-        }
-      }
-
-      // 2. Process tasks that have messages to copy (cursor <= end_id)
+      // 2. Copy the next batch of every running backfill.
       for (const task of groupTasks) {
-        // If backfill was running but cursor has already caught up to or passed end_id, mark complete
-        if (task.backfill_status === "running" && task.cursor !== null && task.end_id !== null && task.cursor > task.end_id) {
-          const res = await advanceTaskProgress(env.DB, task.id, {
-            cursor: task.cursor,
-            processed: task.processed,
-            failed: task.failed,
-            backfill_status: "complete",
-          });
-          task.backfill_status = res.backfill_status;
-        }
-
-        if (task.cursor === null || task.end_id === null || task.cursor > task.end_id) {
+        if (task.backfill_status !== "running" || task.cursor === null || task.end_id === null) continue;
+        if (task.cursor > task.end_id) {
+          if (await markBackfillComplete(env.DB, task.id)) task.backfill_status = "complete";
           continue;
         }
 
-        const claimed = await claimTask(env.DB, task.id, LEASE_SECONDS);
+        const claimed = await claimTask(env.DB, task.id, LEASE_SECONDS, "backfill");
         if (!claimed) continue;
+        let outcome: BatchOutcome = { haltBot: false, backfillComplete: false };
         try {
           batchesRun++;
-          const skipBotForRest = await processOneBatch(env, claimed, bot, client);
-          if (skipBotForRest) break;
+          outcome = await processOneBatch(env, claimed, client);
         } catch (e) {
           console.error(`tick: task ${claimed.id} failed`, e);
         } finally {
           await releaseTaskLease(env.DB, claimed.id);
         }
+        if (outcome.haltBot) return;
+        if (outcome.backfillComplete) task.backfill_status = "complete";
+      }
+
+      // 3. Deliver queued live messages for tasks whose backfill (if any) is out of the way.
+      for (const task of groupTasks) {
+        if (!task.live_enabled || task.backfill_status === "running") continue;
+        if (!(await hasPendingMessages(env.DB, task.id))) continue;
+
+        const claimed = await claimTask(env.DB, task.id, LEASE_SECONDS, "live");
+        if (!claimed) continue;
+        let outcome: DrainOutcome = { haltBot: false, delivered: 0 };
+        try {
+          outcome = await drainPendingMessagesForTask(env, claimed, client);
+        } catch (e) {
+          console.error(`tick: draining pending messages for task ${claimed.id} failed`, e);
+        } finally {
+          await releaseTaskLease(env.DB, claimed.id);
+        }
+        liveDelivered += outcome.delivered;
+        if (outcome.haltBot) return;
       }
     } catch (e) {
       console.error(`tick: bot ${botId} group failed`, e);
     }
   });
 
-  // Also drain pending messages for live-enabled tasks that are not rate-limited
-  const tasksWithPending = await listTasksWithPendingMessages(env.DB);
-  for (const pTask of tasksWithPending) {
-    try {
-      await drainPendingMessagesForTask(env, pTask);
-    } catch (e) {
-      console.error(`tick: draining pending messages for task ${pTask.id} failed`, e);
-    }
-  }
-
   const wallTimeMs = Date.now() - tickStartedAtMs;
-  console.log(`tick: ${groups.length} group(s), ${tasks.length} task(s), ${batchesRun} batch(es), mode: ${isSmoothMode ? "smooth" : "round-robin"}, ${wallTimeMs}ms`);
+  console.log(
+    `tick: ${groups.length} group(s), ${tasks.length} task(s), ${batchesRun} batch(es), ${liveDelivered} live message(s), mode: ${isSmoothMode ? "smooth" : "round-robin"}, ${wallTimeMs}ms`,
+  );
 }
 
-/** Drains buffered live messages in chronological order once backfill completes. */
-async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise<boolean> {
-  // If backfill is still running, hold the live queue so chronological chat order is preserved
-  if (task.backfill_status === "running") return false;
+function rateLimitCooldownSeconds(retryAfter?: number): number {
+  return Math.min(Math.max(retryAfter ?? 0, RATE_LIMIT_COOLDOWN_MIN_SECONDS), RATE_LIMIT_COOLDOWN_MAX_SECONDS);
+}
 
-  const pending = await listPendingMessages(env.DB, task.id, 60);
-  if (pending.length === 0) return false;
+function describeMedia(type: string, size?: number | null, name?: string | null): string {
+  return [getMediaIcon(type), size ? formatBytes(size) : "", name ? `(${name})` : ""].filter(Boolean).join(" ");
+}
 
-  const bot = await getBotWithSecrets(env.DB, task.bot_id);
-  if (!bot) return false;
-  const client = new TelegramClient(bot.token);
+/** Failures that mean one of the task's chats is unusable — not just one message — so retrying
+ * can't help until access is fixed in Telegram and the task is resumed. */
+function isChatLevelFailure(e: TelegramApiError): boolean {
+  return (
+    e.reason === "bot_not_in_chat" ||
+    e.reason === "insufficient_permissions" ||
+    e.message.toLowerCase().includes("upgraded to a supergroup")
+  );
+}
 
+async function maybePruneActivityLog(env: Env, taskId: string, force = false): Promise<void> {
+  if (force || Math.random() < ACTIVITY_PRUNE_SAMPLE_RATE) {
+    await pruneActivityLog(env.DB, taskId);
+  }
+}
+
+/** Pauses every active task on the bot after any one of them trips Telegram's rate limit. */
+async function pauseBotAfterRateLimit(
+  env: Env,
+  task: TaskSummary,
+  kind: ActivityKind,
+  subject: string,
+  retryAfter?: number,
+): Promise<void> {
+  // Honor Telegram's own retry_after when given, but floor/cap it to a "one or two ticks"
+  // window rather than trusting whatever gap the next cron minute happens to land on.
+  const waitSeconds = rateLimitCooldownSeconds(retryAfter);
+  await pauseBotForRateLimit(env.DB, task.bot_id, Math.floor(Date.now() / 1000) + waitSeconds);
+  await appendActivityLog(env.DB, {
+    task_id: task.id,
+    kind,
+    detail: `${subject}: rate limited, pausing bot for ${waitSeconds}s`,
+    ok: true,
+  });
+}
+
+/** A revoked/invalid token is fatal for every task on the bot, not just whichever one noticed. */
+async function stopBotForUnauthorized(env: Env, botId: string, kind: ActivityKind, error: string): Promise<void> {
+  const stopped = await stopTasksForBot(env.DB, botId, "unauthorized");
+  for (const t of stopped) {
+    await appendActivityLog(env.DB, {
+      task_id: t.id,
+      kind,
+      detail: `bot token unauthorized (401) — task auto-stopped (${t.processed} copied, ${t.failed} failed before stopping). The token may have been revoked or changed in @BotFather.`,
+      ok: false,
+      error,
+    });
+  }
+}
+
+/** Pulls new posts with getUpdates and queues the ones each live task should forward. */
+async function pollLiveUpdates(
+  env: Env,
+  bot: BotRow,
+  client: TelegramClient,
+  groupTasks: TaskSummary[],
+): Promise<WorkOutcome> {
+  const liveTasks = groupTasks.filter((t) => t.live_enabled);
+  if (liveTasks.length === 0) return { haltBot: false };
+
+  // getUpdates is one shared stream per bot. Holding the bot-scoped lease while polling keeps
+  // two overlapping ticks from reading — and queueing — the same posts twice.
+  const lease = await claimTask(env.DB, liveTasks[0].id, LEASE_SECONDS, "live");
+  if (!lease) return { haltBot: false };
+
+  try {
+    for (let page = 0; page < MAX_PULL_PAGES; page++) {
+      const updates = await client.getUpdates({
+        offset: bot.last_update_id > 0 ? bot.last_update_id + 1 : undefined,
+        limit: 100,
+        // Channels deliver posts as channel_post; groups deliver them as message.
+        allowed_updates: ["channel_post", "message"],
+      });
+      if (!updates || updates.length === 0) break;
+
+      let maxUpdateId = bot.last_update_id;
+      for (const update of updates) {
+        maxUpdateId = Math.max(maxUpdateId, update.update_id);
+        const post = update.channel_post ?? update.message;
+        if (!post || isServiceMessage(post)) continue;
+        const chatId = String(post.chat.id);
+        for (const task of liveTasks) {
+          if (task.source_chat_id === chatId) await queueLivePost(env, task, post);
+        }
+      }
+
+      // Persist the offset after every page so a failure on a later page can't replay — and
+      // re-queue — posts this page already queued.
+      if (maxUpdateId > bot.last_update_id) {
+        await updateBotLastUpdateId(env.DB, bot.id, maxUpdateId);
+        bot.last_update_id = maxUpdateId;
+      }
+      if (updates.length < 100) break;
+    }
+    return { haltBot: false };
+  } catch (e) {
+    if (e instanceof TelegramApiError && e.reason === "unauthorized") {
+      console.warn(`tick: bot ${bot.bot_username} unauthorized (401), stopping its tasks.`);
+      await stopBotForUnauthorized(env, bot.id, "live_forward", e.message);
+      return { haltBot: true };
+    }
+    if (e instanceof TelegramApiError && e.reason === "rate_limited") {
+      await pauseBotAfterRateLimit(env, lease, "live_forward", "getUpdates", e.retryAfter);
+      return { haltBot: true };
+    }
+    if (e instanceof TelegramApiError && (e.errorCode === 409 || e.message.toLowerCase().includes("webhook"))) {
+      // A webhook (or another poller) owns this bot's update stream. Clearing the webhook lets the
+      // next tick poll again; backfill and queued deliveries below don't depend on it.
+      console.warn(`tick: getUpdates conflict for bot ${bot.bot_username}, calling deleteWebhook to restore polling.`);
+      try {
+        await client.deleteWebhook();
+      } catch (delErr) {
+        console.error(`tick: failed to deleteWebhook for bot ${bot.bot_username}:`, delErr);
+      }
+      return { haltBot: false };
+    }
+    console.error(`tick: getUpdates failed for bot ${bot.bot_username}`, e);
+    return { haltBot: false };
+  } finally {
+    await releaseTaskLease(env.DB, lease.id);
+  }
+}
+
+/** Decides what happens to one new source-chat post for one live task: ignore it, record it as
+ * filtered out, or add it to the task's pending queue for delivery. */
+async function queueLivePost(env: Env, task: TaskSummary, post: TelegramMessage): Promise<void> {
+  const coveredByBackfill =
+    task.scope === "live_and_backfill" && task.end_id !== null && post.message_id <= task.end_id;
+  const predatesTask = post.date < task.created_at - LIVE_BACKLOG_GRACE_SECONDS;
+  if (coveredByBackfill || predatesTask) return;
+
+  const meta = extractMessageMetadata(post);
+  const mediaDesc = describeMedia(meta.type, meta.size, meta.name);
+  const evaluation = evaluateMessageFilter(post, {
+    mediaTypes: task.filter_media_types
+      ? task.filter_media_types.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined,
+    minSizeBytes: task.filter_min_size_bytes,
+    maxSizeBytes: task.filter_max_size_bytes,
+  });
+
+  if (evaluation.matched) {
+    await insertPendingMessage(env.DB, task.id, post.message_id, meta.type, meta.size ?? null, meta.name ?? null);
+    if (task.backfill_status !== "running") return;
+    await appendActivityLog(env.DB, {
+      task_id: task.id,
+      kind: "live_forward",
+      detail: `⏳ Queued in buffer: ${mediaDesc} · msg #${post.message_id} (waiting for backfill to finish)`,
+      ok: true,
+    });
+  } else {
+    await incrementLiveCounters(env.DB, task.id, 0, 0, 1);
+    await appendActivityLog(env.DB, {
+      task_id: task.id,
+      kind: "live_forward",
+      detail: `${mediaDesc} · msg #${post.message_id} skipped: ${evaluation.reason}`,
+      ok: false,
+      error: `Filtered: ${evaluation.reason}`,
+    });
+  }
+  await maybePruneActivityLog(env, task.id);
+}
+
+/** Delivers a task's queued live messages oldest-first, one copyMessage call each. */
+async function drainPendingMessagesForTask(env: Env, task: TaskSummary, client: TelegramClient): Promise<DrainOutcome> {
+  const outcome: DrainOutcome = { haltBot: false, delivered: 0 };
+  // Hold the live queue while a backfill runs so the destination keeps chronological order.
+  if (task.backfill_status === "running") return outcome;
+
+  const pending = await listPendingMessages(env.DB, task.id, MAX_PENDING_DRAIN_PER_TICK);
   for (const item of pending) {
-    const icon = getMediaIcon(item.media_type ?? "text");
-    const sizeStr = item.file_size ? formatBytes(item.file_size) : "";
-    const fileDesc = [icon, sizeStr, item.file_name ? `(${item.file_name})` : ""].filter(Boolean).join(" ");
-
+    const label = `${describeMedia(item.media_type ?? "text", item.file_size, item.file_name)} · msg #${item.message_id}`;
     try {
       await client.copyMessage(task.dest_chat_id, task.source_chat_id, item.message_id);
-      await deletePendingMessages(env.DB, [item.id]);
-      await incrementLiveCounters(env.DB, task.id, 1, 0, 0);
-      await appendActivityLog(env.DB, {
-        task_id: task.id,
-        kind: "live_forward",
-        detail: `Copied ${fileDesc} · msg #${item.message_id} (delivered from live queue)`,
-        ok: true,
-      });
     } catch (e) {
-      const error = e instanceof Error ? e.message : String(e);
-      if (e instanceof TelegramApiError && e.reason === "rate_limited") {
-        const waitSeconds = Math.min(
-          Math.max(e.retryAfter ?? 0, RATE_LIMIT_COOLDOWN_MIN_SECONDS),
-          RATE_LIMIT_COOLDOWN_MAX_SECONDS,
-        );
-        await pauseBotForRateLimit(env.DB, task.bot_id, Math.floor(Date.now() / 1000) + waitSeconds);
-        return true;
+      if (!(e instanceof TelegramApiError)) {
+        // Network failure or a non-JSON response — transient, so keep the message queued.
+        console.error(`tick: live delivery for task ${task.id} failed, retrying next tick`, e);
+        break;
       }
-      if (e instanceof TelegramApiError && e.reason === "unauthorized") {
-        await stopTasksForBot(env.DB, task.bot_id, "unauthorized");
-        return true;
+      if (e.reason === "rate_limited") {
+        await pauseBotAfterRateLimit(env, task, "live_forward", `msg #${item.message_id}`, e.retryAfter);
+        outcome.haltBot = true;
+        break;
       }
-      // If the message no longer exists in source, remove from queue to avoid blocking
-      if (
-        e instanceof TelegramApiError &&
-        (e.message.toLowerCase().includes("not found") ||
-          e.message.toLowerCase().includes("message to forward not found") ||
-          e.message.toLowerCase().includes("message to copy not found"))
-      ) {
-        await deletePendingMessages(env.DB, [item.id]);
+      if (e.reason === "unauthorized") {
+        await stopBotForUnauthorized(env, task.bot_id, "live_forward", e.message);
+        outcome.haltBot = true;
+        break;
+      }
+      if (isChatLevelFailure(e)) {
+        // The queue is kept: once access is fixed and the task resumed, delivery picks up here.
+        await stopTask(env.DB, task.id, e.reason);
         await appendActivityLog(env.DB, {
           task_id: task.id,
           kind: "live_forward",
-          detail: `msg #${item.message_id}: not found in source, removed from queue`,
+          detail: `${label}: ${e.reason} — task auto-stopped, queued messages kept`,
           ok: false,
-          error,
+          error: e.message,
         });
+        break;
       }
+      if (e.reason === "invalid_request") {
+        // Telegram refuses this particular message (deleted from the source, a poll, protected
+        // content, …). It can never succeed, so drop it instead of blocking every later message.
+        await deletePendingMessages(env.DB, [item.id]);
+        await incrementLiveCounters(env.DB, task.id, 0, 1, 0);
+        await appendActivityLog(env.DB, {
+          task_id: task.id,
+          kind: "live_forward",
+          detail: `${label}: can't be copied, removed from queue`,
+          ok: false,
+          error: e.message,
+        });
+        continue;
+      }
+      // Telegram-side 5xx or an unclassified error — likely transient, retry next tick.
+      await appendActivityLog(env.DB, {
+        task_id: task.id,
+        kind: "live_forward",
+        detail: `${label}: ${e.reason}, retrying next tick`,
+        ok: false,
+        error: e.message,
+      });
       break;
     }
+
+    await deletePendingMessages(env.DB, [item.id]);
+    await incrementLiveCounters(env.DB, task.id, 1, 0, 0);
+    await appendActivityLog(env.DB, {
+      task_id: task.id,
+      kind: "live_forward",
+      detail: `Copied ${label} (delivered from live queue)`,
+      ok: true,
+    });
+    outcome.delivered++;
   }
-  return false;
+
+  if (pending.length > 0) await maybePruneActivityLog(env, task.id);
+  return outcome;
 }
 
-/** Returns true when this call discovered the bot's token is dead (stopped
- * every task on it) or the bot just got rate-limited (paused every active
- * task on it) — either way runTick should skip the bot's other tasks for
- * the rest of this run instead of making more doomed Telegram calls. */
-async function processOneBatch(env: Env, task: TaskSummary, botParam?: BotRow, clientParam?: TelegramClient): Promise<boolean> {
-  if (task.cursor === null || task.end_id === null) return false;
-  const bot = botParam ?? (await getBotWithSecrets(env.DB, task.bot_id));
-  if (!bot) return false;
-  const client = clientParam ?? new TelegramClient(bot.token);
+/** Copies the next batch of a running backfill with a single bulk copyMessages call. */
+async function processOneBatch(env: Env, task: TaskSummary, client: TelegramClient): Promise<BatchOutcome> {
+  const keepGoing: BatchOutcome = { haltBot: false, backfillComplete: false };
+  if (task.cursor === null || task.end_id === null) return keepGoing;
 
+  const fromCursor = task.cursor;
   const batchStartedAtMs = Date.now();
-  const batchEnd = Math.min(task.cursor + task.pacing_batch_size - 1, task.end_id, task.cursor + MAX_BATCH_IDS - 1);
+  const batchEnd = Math.min(fromCursor + task.pacing_batch_size - 1, task.end_id, fromCursor + MAX_BATCH_IDS - 1);
+  const range = `ids ${fromCursor}-${batchEnd}`;
   const messageIds: number[] = [];
-  for (let id = task.cursor; id <= batchEnd; id++) messageIds.push(id);
+  for (let id = fromCursor; id <= batchEnd; id++) messageIds.push(id);
 
   // Bulk copyMessages: one API call per batch, matching the throughput the
   // pacing defaults were diagnosed against. Telegram silently skips ids it
@@ -359,36 +464,14 @@ async function processOneBatch(env: Env, task: TaskSummary, botParam?: BotRow, c
   } catch (e) {
     if (e instanceof TelegramApiError && e.reason === "rate_limited") {
       // Whole batch rejected — don't advance the cursor, same range retries
-      // once the cooldown lifts. Honor Telegram's own retry_after when
-      // given, but floor/cap it to a "one or two ticks" window rather than
-      // trusting whatever gap the very next cron minute happens to land on.
-      const waitSeconds = Math.min(
-        Math.max(e.retryAfter ?? 0, RATE_LIMIT_COOLDOWN_MIN_SECONDS),
-        RATE_LIMIT_COOLDOWN_MAX_SECONDS,
-      );
-      await pauseBotForRateLimit(env.DB, task.bot_id, Math.floor(Date.now() / 1000) + waitSeconds);
-      await appendActivityLog(env.DB, {
-        task_id: task.id,
-        kind: "backfill_batch",
-        detail: `ids ${task.cursor}-${batchEnd}: rate limited, pausing bot for ${waitSeconds}s`,
-        ok: true,
-      });
-      return true;
+      // once the cooldown lifts.
+      await pauseBotAfterRateLimit(env, task, "backfill_batch", range, e.retryAfter);
+      return { haltBot: true, backfillComplete: false };
     }
     if (e instanceof TelegramApiError && e.reason === "unauthorized") {
-      // Token revoked/invalid — fatal for every task on this bot, not just
-      // this one. Stop them all now instead of retrying forever.
-      const stopped = await stopTasksForBot(env.DB, task.bot_id, "unauthorized");
-      for (const t of stopped) {
-        await appendActivityLog(env.DB, {
-          task_id: t.id,
-          kind: "backfill_batch",
-          detail: `bot token unauthorized (401) — task auto-stopped (${t.processed} copied, ${t.failed} failed before stopping)`,
-          ok: false,
-          error: e.message,
-        });
-      }
-      return true;
+      // Token revoked/invalid — stop every task on this bot now instead of retrying forever.
+      await stopBotForUnauthorized(env, task.bot_id, "backfill_batch", e.message);
+      return { haltBot: true, backfillComplete: false };
     }
     if (
       e instanceof TelegramApiError &&
@@ -407,85 +490,62 @@ async function processOneBatch(env: Env, task: TaskSummary, botParam?: BotRow, c
       // instead of retrying (or crawling one id at a time through) the
       // same range forever.
       succeeded = 0;
-    } else if (e instanceof TelegramApiError && (e.reason === "bot_not_in_chat" || e.reason === "insufficient_permissions")) {
-      // Bot lost access to one of this task's chats (kicked, or no longer
-      // admin) — won't self-heal by retrying. Auto-stop just this task, not
-      // the whole bot, since sibling tasks on the same bot may point at
-      // unaffected chats. This used to fall into the catch-all rethrow
-      // below and retry silently forever with nothing written to the
-      // activity log — see the generic branch's comment for why that was a
-      // problem. Fixing access in Telegram and resuming from the UI clears
-      // stop_reason (updateTaskStatus) and picks up from the same cursor.
+    } else if (e instanceof TelegramApiError && isChatLevelFailure(e)) {
+      // Bot lost access to one of this task's chats (kicked, no longer
+      // admin, chat migrated) — won't self-heal by retrying. Auto-stop just
+      // this task, not the whole bot, since sibling tasks on the same bot
+      // may point at unaffected chats. Fixing access in Telegram and
+      // resuming from the UI clears stop_reason and picks up from the same
+      // cursor.
       await stopTask(env.DB, task.id, e.reason);
       await appendActivityLog(env.DB, {
         task_id: task.id,
         kind: "backfill_batch",
-        detail: `ids ${task.cursor}-${batchEnd}: ${e.reason} — task auto-stopped`,
+        detail: `${range}: ${e.reason} — task auto-stopped`,
         ok: false,
         error: e.message,
       });
-      return false;
+      return keepGoing;
     } else {
       // Any other Telegram-classified reason (invalid_request/unknown) or a
-      // non-Telegram error (network, D1, etc.). Previously this rethrew and
-      // was only ever visible via console.error — never written to
-      // task_activity_log — so a persistently failing task looked identical
-      // to a healthy one from the DB/UI's perspective, retrying forever with
-      // zero trace. Log every occurrence instead; these can be transient, so
-      // don't advance the cursor or stop the task, just retry next tick.
+      // non-Telegram error (network, D1, etc.). These can be transient, so
+      // log every occurrence but don't advance the cursor or stop the task —
+      // just retry next tick.
       const reason = e instanceof TelegramApiError ? e.reason : "unexpected error";
       const message = e instanceof Error ? e.message : String(e);
       await appendActivityLog(env.DB, {
         task_id: task.id,
         kind: "backfill_batch",
-        detail: `ids ${task.cursor}-${batchEnd}: ${reason}, resuming next tick`,
+        detail: `${range}: ${reason}, resuming next tick`,
         ok: false,
         error: message,
       });
-      return false;
+      return keepGoing;
     }
   }
 
   const batchDurationMs = Date.now() - batchStartedAtMs;
   const skipped = messageIds.length - succeeded;
-  const newCursor = batchEnd + 1;
-  const wasBackfilling = task.backfill_status !== "complete";
-
-  let newProcessed = task.processed;
-  let newFailed = task.failed;
-  let newLiveProcessed = task.live_processed ?? 0;
-  let newLiveFailed = task.live_failed ?? 0;
-
-  if (wasBackfilling) {
-    newProcessed += succeeded;
-    newFailed += skipped;
-  } else {
-    newLiveProcessed += succeeded;
-    newLiveFailed += skipped;
-  }
-
-  const progressResult = await advanceTaskProgress(env.DB, task.id, {
-    cursor: newCursor,
-    processed: newProcessed,
-    failed: newFailed,
-    live_processed: newLiveProcessed,
-    live_failed: newLiveFailed,
+  const progress = await advanceTaskProgress(env.DB, task.id, {
+    fromCursor,
+    toCursor: batchEnd + 1,
+    processedDelta: succeeded,
+    failedDelta: skipped,
   });
 
-  const justCompletedBackfill = wasBackfilling && progressResult.complete;
-  const isLiveScope = task.scope === "live" || (task.scope === "live_and_backfill" && !wasBackfilling);
+  const notes = [
+    progress.complete ? "backfill complete" : "",
+    progress.applied ? "" : "task was edited mid-batch, kept the edited progress",
+  ].filter(Boolean);
   await appendActivityLog(env.DB, {
     task_id: task.id,
-    kind: isLiveScope ? "live_forward" : "backfill_batch",
-    detail: `ids ${task.cursor}-${batchEnd}: ${succeeded} ok, ${skipped} skipped, took ${batchDurationMs}ms${justCompletedBackfill ? " (backfill complete)" : ""}`,
+    kind: "backfill_batch",
+    detail: `${range}: ${succeeded} ok, ${skipped} skipped, took ${batchDurationMs}ms${notes.length > 0 ? ` (${notes.join("; ")})` : ""}`,
     ok: true,
     error: skipped > 0 ? `${skipped} message(s) in this range skipped by Telegram (not found / can't be copied)` : undefined,
   });
 
-  // Throttled pruning: running subquery DELETEs on every single 60-msg batch
-  // produces heavy D1 scan/write amplification. Prune on completion or 5% sample.
-  if (progressResult.complete || Math.random() < 0.05) {
-    await pruneActivityLog(env.DB, task.id);
-  }
-  return false;
+  // Prune on completion, otherwise on a small sample of batches.
+  await maybePruneActivityLog(env, task.id, progress.complete);
+  return { haltBot: false, backfillComplete: progress.complete };
 }
