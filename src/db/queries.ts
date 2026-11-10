@@ -188,8 +188,8 @@ export interface NewTask {
   filter_max_size_bytes?: number | null;
 }
 
-export async function insertTask(db: D1Database, t: NewTask): Promise<void> {
-  await db
+function insertTaskStatement(db: D1Database, t: NewTask): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO tasks (
         id, bot_id, label, source_chat_id, source_chat_title, dest_chat_id, dest_chat_title,
@@ -217,8 +217,16 @@ export async function insertTask(db: D1Database, t: NewTask): Promise<void> {
       t.filter_media_types ?? null,
       t.filter_min_size_bytes ?? null,
       t.filter_max_size_bytes ?? null,
-    )
-    .run();
+    );
+}
+
+export async function insertTasks(db: D1Database, tasks: NewTask[]): Promise<void> {
+  if (tasks.length === 0) return;
+  await db.batch(tasks.map((task) => insertTaskStatement(db, task)));
+}
+
+export async function insertTask(db: D1Database, task: NewTask): Promise<void> {
+  await insertTasks(db, [task]);
 }
 
 export async function listTasksByBot(db: D1Database, botId: string): Promise<TaskSummary[]> {
@@ -1053,4 +1061,3 @@ export async function enrichSavedChannelsByChatId(
 export async function deleteSavedChannel(db: D1Database, id: string): Promise<void> {
   await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(id).run();
 }
-
