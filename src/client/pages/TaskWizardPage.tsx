@@ -1146,20 +1146,24 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
               <div className="field" style={{ marginBottom: 0 }}>
                 <label>Select Saved Target Channels</label>
-                <select
-                  className="input"
-                  disabled={lookingUpDest}
-                  multiple
-                  size={Math.min(5, targetChannels.length)}
-                  value={targetChannels.filter((c) => destinationIds.includes(c.chat_id)).map((c) => c.chat_id)}
-                  onChange={(e) => handleSelectTargetChannels(Array.from(e.target.selectedOptions, (option) => option.value))}
-                >
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   {targetChannels.map((c) => (
-                    <option key={c.id} value={c.chat_id}>
-                      {c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}
-                    </option>
+                    <label key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, cursor: lookingUpDest ? "default" : "pointer" }}>
+                      <input
+                        type="checkbox"
+                        checked={destinationIds.includes(c.chat_id)}
+                        disabled={lookingUpDest}
+                        onChange={() => {
+                          const nextIds = destinationIds.includes(c.chat_id)
+                            ? destinationIds.filter((id) => id !== c.chat_id)
+                            : [...destinationIds, c.chat_id];
+                          void handleSelectTargetChannels(nextIds);
+                        }}
+                      />
+                      <span>{c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}</span>
+                    </label>
                   ))}
-                </select>
+                </div>
               </div>
             </div>
           )}
