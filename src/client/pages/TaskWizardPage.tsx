@@ -10,9 +10,11 @@ import { navigate } from "../lib/router";
 import { getTaskDisplayInfo } from "../lib/useTasksContext";
 import type {
   BotSummary,
-  BotVerifyResult,
+  BulkBotsResult,
+  BulkChannelsResult,
   ChatLookupResult,
   ErrorReason,
+  SavedChannel,
   SavedTaskWithToken,
   TaskScope,
   TaskSummary,
@@ -22,7 +24,14 @@ type BackfillMode = "range" | "lastN";
 
 export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
   const toast = useToast();
-  const { data: bots } = usePolling(() => api.get<BotSummary[]>("/api/bots"), 15000);
+  const { data: bots, refetch: refetchBots } = usePolling(() => api.get<BotSummary[]>("/api/bots"), 15000);
+  const { data: savedChannels, refetch: refetchChannels } = usePolling(
+    () => api.get<SavedChannel[]>("/api/channels"),
+    15000,
+  );
+
+  const sourceChannels = (savedChannels ?? []).filter((c) => c.role === "source");
+  const targetChannels = (savedChannels ?? []).filter((c) => c.role === "target");
 
   // Step 1: bot
   const [selectedBotId, setSelectedBotId] = useState<string>("");
@@ -44,6 +53,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
   // Step 2: source chat
   const [sourceChatId, setSourceChatId] = useState("");
+  const [savingSourceChannels, setSavingSourceChannels] = useState(false);
   const [sourceLookup, setSourceLookup] = useState<ChatLookupResult | null>(null);
   const [sourceError, setSourceError] = useState<{ reason: ErrorReason; description: string } | null>(null);
   const [lookingUpSource, setLookingUpSource] = useState(false);
@@ -54,6 +64,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
 
   // Step 3: destination + config
   const [destChatId, setDestChatId] = useState("");
+  const [savingTargetChannels, setSavingTargetChannels] = useState(false);
   const [destLookup, setDestLookup] = useState<ChatLookupResult | null>(null);
   const [destError, setDestError] = useState<{ reason: ErrorReason; description: string } | null>(null);
   const [lookingUpDest, setLookingUpDest] = useState(false);
@@ -144,39 +155,138 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
     if (!newToken.trim()) return;
     setBotError(null);
     setSavingBot(true);
-    const res = await api.post<BotVerifyResult>("/api/bots/verify", { token: newToken.trim() });
+    const res = await api.post<BulkBotsResult>("/api/bots/bulk", { rawInput: newToken.trim() });
     setSavingBot(false);
     if (!res.ok) {
       setBotError(res.description);
       return;
     }
-    toast.show("success", `Verified @${res.data.bot_username}`);
-    setSelectedBotId("");
-    setPendingBot({ token: newToken.trim(), bot_id: res.data.bot_id, bot_username: res.data.bot_username });
-    setBotActiveTasks(res.data.active_tasks ?? []);
+    const { added, errors } = res.data;
+    await refetchBots();
     setNewToken("");
+
+    if (errors.length > 0) {
+      setBotError(`Some tokens failed: ${errors.map((e) => `${e.tokenPreview} (${e.error})`).join(", ")}`);
+    }
+
+    if (added.length === 1) {
+      toast.show("success", `Verified & saved @${added[0].bot_username}`);
+      await handleSelectBot(added[0].id);
+    } else if (added.length > 1) {
+      toast.show(
+        "success",
+        `Verified & saved ${added.length} bots (${added.map((b) => `@${b.bot_username}`).join(", ")})`,
+      );
+      await handleSelectBot(added[0].id);
+    }
   }
 
-  async function lookupSource() {
-    if (!hasBot || !sourceChatId) return;
+  async function lookupSource(overrideChatId?: string) {
+    const targetId = (overrideChatId ?? sourceChatId).trim();
+    if (!hasBot || !targetId) return;
     setLookingUpSource(true);
     setSourceError(null);
     setSourceLookup(null);
-    const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(sourceChatId)}?${botQuery()}`);
+    const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(targetId)}?${botQuery()}`);
     setLookingUpSource(false);
-    if (res.ok) setSourceLookup(res.data);
-    else setSourceError({ reason: res.reason, description: res.description });
+    if (res.ok) {
+      setSourceLookup(res.data);
+      refetchChannels();
+    } else {
+      setSourceError({ reason: res.reason, description: res.description });
+    }
   }
 
-  async function lookupDest() {
-    if (!hasBot || !destChatId) return;
+  async function lookupDest(overrideChatId?: string) {
+    const targetId = (overrideChatId ?? destChatId).trim();
+    if (!hasBot || !targetId) return;
     setLookingUpDest(true);
     setDestError(null);
     setDestLookup(null);
-    const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(destChatId)}?${botQuery()}`);
+    const res = await api.get<ChatLookupResult>(`/api/chats/${encodeURIComponent(targetId)}?${botQuery()}`);
     setLookingUpDest(false);
-    if (res.ok) setDestLookup(res.data);
-    else setDestError({ reason: res.reason, description: res.description });
+    if (res.ok) {
+      setDestLookup(res.data);
+      refetchChannels();
+    } else {
+      setDestError({ reason: res.reason, description: res.description });
+    }
+  }
+
+  async function handleSaveSourceChannels() {
+    if (!sourceChatId.trim()) return;
+    setSavingSourceChannels(true);
+    const res = await api.post<BulkChannelsResult>("/api/channels/bulk", {
+      role: "source",
+      rawInput: sourceChatId.trim(),
+      botId: selectedBotId || undefined,
+      botToken: pendingBot?.token,
+    });
+    setSavingSourceChannels(false);
+    if (!res.ok) {
+      toast.show("error", res.description);
+      return;
+    }
+    const saved = res.data.saved;
+    await refetchChannels();
+    toast.show("success", `Saved ${saved.length} source channel${saved.length === 1 ? "" : "s"}`);
+    if (saved.length === 1) {
+      setSourceChatId(saved[0].chat_id);
+      if (hasBot) await lookupSource(saved[0].chat_id);
+    } else if (saved.length > 1) {
+      setSourceChatId(saved[0].chat_id);
+      if (hasBot) await lookupSource(saved[0].chat_id);
+    }
+  }
+
+  async function handleSaveTargetChannels() {
+    if (!destChatId.trim()) return;
+    setSavingTargetChannels(true);
+    const res = await api.post<BulkChannelsResult>("/api/channels/bulk", {
+      role: "target",
+      rawInput: destChatId.trim(),
+      botId: selectedBotId || undefined,
+      botToken: pendingBot?.token,
+    });
+    setSavingTargetChannels(false);
+    if (!res.ok) {
+      toast.show("error", res.description);
+      return;
+    }
+    const saved = res.data.saved;
+    await refetchChannels();
+    toast.show("success", `Saved ${saved.length} target channel${saved.length === 1 ? "" : "s"}`);
+    if (saved.length === 1) {
+      setDestChatId(saved[0].chat_id);
+      if (hasBot) await lookupDest(saved[0].chat_id);
+    } else if (saved.length > 1) {
+      setDestChatId(saved[0].chat_id);
+      if (hasBot) await lookupDest(saved[0].chat_id);
+    }
+  }
+
+  async function handleSelectSourceChannel(chatId: string) {
+    setSourceChatId(chatId);
+    if (!chatId) {
+      setSourceLookup(null);
+      setSourceError(null);
+      return;
+    }
+    if (hasBot) {
+      await lookupSource(chatId);
+    }
+  }
+
+  async function handleSelectTargetChannel(chatId: string) {
+    setDestChatId(chatId);
+    if (!chatId) {
+      setDestLookup(null);
+      setDestError(null);
+      return;
+    }
+    if (hasBot) {
+      await lookupDest(chatId);
+    }
   }
 
   async function generateInviteLink() {
@@ -324,7 +434,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
             <div>
               <div className="field" style={{ marginBottom: 6 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                  <label style={{ margin: 0, fontWeight: 600 }}>Telegram Bot Token</label>
+                  <label style={{ margin: 0, fontWeight: 600 }}>Telegram Bot Token(s)</label>
                   <a
                     href="https://t.me/BotFather"
                     target="_blank"
@@ -334,17 +444,18 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                     Get token from @BotFather ↗
                   </a>
                 </div>
-                <input
+                <textarea
                   className="input"
+                  rows={2}
+                  style={{ fontFamily: "var(--font-mono, monospace)", resize: "vertical" }}
                   value={newToken}
                   onChange={(e) => setNewToken(e.target.value)}
-                  placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ…"
-                  type="password"
+                  placeholder={"Paste one or multiple bot tokens (one per line or comma-separated)…\n123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ…"}
                   autoFocus={!fromSavedId}
                 />
               </div>
               <p className="text-muted" style={{ fontSize: 12, marginBottom: 10 }}>
-                Token is verified directly with Telegram API to check permissions, bot username, and active workloads.
+                Tokens are verified directly with Telegram API and saved for reuse. You can paste multiple tokens at once.
               </p>
               {botError && (
                 <div style={{ marginBottom: 10 }}>
@@ -356,7 +467,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                 disabled={!newToken.trim() || savingBot}
                 onClick={verifyNewBot}
               >
-                {savingBot ? "Verifying with Telegram…" : "Verify & Connect Bot"}
+                {savingBot ? "Verifying with Telegram…" : "Verify & Save Bot(s)"}
               </button>
             </div>
 
@@ -608,20 +719,82 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
           </div>
 
           <div className="field">
-            <label>Source Chat ID or @username</label>
+            <label>Source Chat ID or @username (paste one or multiple to save)</label>
             <div className="row">
               <input
                 className="input"
                 style={{ flex: 1 }}
                 value={sourceChatId}
                 onChange={(e) => setSourceChatId(e.target.value)}
-                placeholder="e.g. -1001234567890 or @channel"
+                onPaste={(e) => {
+                  const text = e.clipboardData.getData("text");
+                  if (text.includes("\n")) {
+                    e.preventDefault();
+                    const joined = text
+                      .split(/\r?\n/)
+                      .map((s) => s.trim())
+                      .filter(Boolean)
+                      .join(", ");
+                    setSourceChatId((prev) => (prev ? `${prev}, ${joined}` : joined));
+                  }
+                }}
+                placeholder="e.g. -1001234567890 or @channel (comma-separated for multiple)"
               />
-              <button className="btn btn-secondary" disabled={!sourceChatId || lookingUpSource} onClick={lookupSource}>
+              <button
+                className="btn btn-secondary"
+                disabled={!sourceChatId.trim() || lookingUpSource}
+                onClick={() => lookupSource()}
+              >
                 {lookingUpSource ? "Checking…" : "Check"}
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={!sourceChatId.trim() || savingSourceChannels}
+                onClick={handleSaveSourceChannels}
+                title="Save entered channel(s) to Source Channels"
+              >
+                {savingSourceChannels ? "Saving…" : "+ Save Source"}
               </button>
             </div>
           </div>
+
+          {sourceChannels.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                  margin: "6px 0 14px",
+                  color: "var(--text-dim)",
+                  fontSize: 11.5,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                  fontWeight: 600,
+                }}
+              >
+                <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />
+                <span>or choose from existing source channels ({sourceChannels.length})</span>
+                <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />
+              </div>
+
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label>Select Saved Source Channel</label>
+                <select
+                  className="input"
+                  value={sourceChannels.some((c) => c.chat_id === sourceChatId) ? sourceChatId : ""}
+                  onChange={(e) => handleSelectSourceChannel(e.target.value)}
+                >
+                  <option value="">Choose a previously saved source channel…</option>
+                  {sourceChannels.map((c) => (
+                    <option key={c.id} value={c.chat_id}>
+                      {c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
 
           {sourceError && <PermissionErrorBanner reason={sourceError.reason} description={sourceError.description} />}
 
@@ -856,20 +1029,82 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
           </div>
 
           <div className="field">
-            <label>Destination chat</label>
+            <label>Destination / Target Chat ID or @username (paste one or multiple to save)</label>
             <div className="row">
               <input
                 className="input"
                 style={{ flex: 1 }}
                 value={destChatId}
                 onChange={(e) => setDestChatId(e.target.value)}
-                placeholder="e.g. -1009876543210 or @destchannel"
+                onPaste={(e) => {
+                  const text = e.clipboardData.getData("text");
+                  if (text.includes("\n")) {
+                    e.preventDefault();
+                    const joined = text
+                      .split(/\r?\n/)
+                      .map((s) => s.trim())
+                      .filter(Boolean)
+                      .join(", ");
+                    setDestChatId((prev) => (prev ? `${prev}, ${joined}` : joined));
+                  }
+                }}
+                placeholder="e.g. -1009876543210 or @destchannel (comma-separated for multiple)"
               />
-              <button className="btn btn-secondary" disabled={!destChatId || lookingUpDest} onClick={lookupDest}>
+              <button
+                className="btn btn-secondary"
+                disabled={!destChatId.trim() || lookingUpDest}
+                onClick={() => lookupDest()}
+              >
                 {lookingUpDest ? "Checking…" : "Check"}
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={!destChatId.trim() || savingTargetChannels}
+                onClick={handleSaveTargetChannels}
+                title="Save entered channel(s) to Target Channels"
+              >
+                {savingTargetChannels ? "Saving…" : "+ Save Target"}
               </button>
             </div>
           </div>
+
+          {targetChannels.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                  margin: "6px 0 14px",
+                  color: "var(--text-dim)",
+                  fontSize: 11.5,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                  fontWeight: 600,
+                }}
+              >
+                <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />
+                <span>or choose from existing target channels ({targetChannels.length})</span>
+                <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />
+              </div>
+
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label>Select Saved Target Channel</label>
+                <select
+                  className="input"
+                  value={targetChannels.some((c) => c.chat_id === destChatId) ? destChatId : ""}
+                  onChange={(e) => handleSelectTargetChannel(e.target.value)}
+                >
+                  <option value="">Choose a previously saved target channel…</option>
+                  {targetChannels.map((c) => (
+                    <option key={c.id} value={c.chat_id}>
+                      {c.label}{c.label !== c.chat_id ? ` (${c.chat_id})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
 
           {destError && <PermissionErrorBanner reason={destError.reason} description={destError.description} />}
 

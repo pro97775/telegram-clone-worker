@@ -185,6 +185,30 @@ export interface SavedTaskWithToken extends SavedTaskSummary {
   bot_token: string;
 }
 
+// Saved Channels (Source & Target)
+
+export type ChannelRole = "source" | "target";
+
+export interface SavedChannel {
+  id: string;
+  role: ChannelRole;
+  chat_id: string;
+  title: string | null;
+  username: string | null;
+  label: string;
+  created_at: number;
+}
+
+export interface BulkBotsResult {
+  added: BotSummary[];
+  errors: Array<{ tokenPreview: string; error: string }>;
+}
+
+export interface BulkChannelsResult {
+  saved: SavedChannel[];
+  errors: Array<{ input: string; error: string }>;
+}
+
 // Authentication
 
 export type AuthMode = "enforced" | "open";

@@ -1,8 +1,9 @@
 import { TelegramClient, type PromoteRights } from "../../telegram/client";
 import { toResult } from "../../telegram/errors";
-import { getBotWithSecrets } from "../../db/queries";
-import { lookupChat } from "../../telegram/chatLookup";
+import { deriveCapabilities } from "../../telegram/capabilities";
+import { enrichSavedChannelsByChatId, getBotWithSecrets, listTasksForSourceChat } from "../../db/queries";
 import { resolveLastN } from "../../jobs/resolveRange";
+import type { ChatLookupResult } from "../../shared/rpcTypes";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -37,7 +38,55 @@ async function loadClientAndBotId(
 export async function handleGetChat(env: Env, chatId: string, botId: string, token: string, botTelegramId: string): Promise<Response> {
   const loaded = await loadClientAndBotId(env, botId, token, botTelegramId);
   if (!loaded) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
-  const result = await lookupChat(env.DB, loaded.client, loaded.botTelegramId, chatId);
+  const { client, botTelegramId: telegramId } = loaded;
+
+  const result = await toResult(async (): Promise<ChatLookupResult> => {
+    const chat = await client.getChat(chatId);
+    const member = await client.getChatMember(chatId, telegramId);
+
+    let memberCount = undefined;
+    try {
+      memberCount = await client.getChatMemberCount(chatId);
+    } catch (e) {
+      // ignore
+    }
+
+    let admins = undefined;
+    try {
+      const adminData = await client.getChatAdministrators(chatId);
+      admins = adminData.map((a) => ({
+        id: a.user.id,
+        name: a.user.first_name + (a.user.username ? ` (@${a.user.username})` : ""),
+        status: a.status,
+        is_bot: a.user.is_bot,
+      }));
+    } catch (e) {
+      // ignore
+    }
+
+    const pastTasks = await listTasksForSourceChat(env.DB, [chatId, String(chat.id)]);
+
+    try {
+      await enrichSavedChannelsByChatId(
+        env.DB,
+        [chatId, String(chat.id), chat.username ? `@${chat.username}` : ""],
+        String(chat.id),
+        chat.title,
+        chat.username,
+      );
+    } catch {
+      // ignore
+    }
+
+    return {
+      chat: { id: chat.id, type: chat.type, title: chat.title, username: chat.username },
+      botStatus: member.status,
+      capabilities: deriveCapabilities(member, chat.type),
+      memberCount,
+      admins,
+      pastTasks,
+    };
+  });
   return json(result, result.ok ? 200 : 400);
 }
 
