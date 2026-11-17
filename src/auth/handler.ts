@@ -236,13 +236,7 @@ export async function handleAuthSetup(request: Request, env: Env): Promise<Respo
     );
   }
 
-  const salt = generateSalt();
-  const hash = await hashPassword(newPassword, salt);
-
-  await env.DB.batch([
-    env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('admin_password_hash', ?)").bind(hash),
-    env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('admin_password_salt', ?)").bind(salt),
-  ]);
+  await storeAdminPassword(env, newPassword);
 
   const secret = await getSigningSecret(env);
   const token = await signSessionToken(
@@ -285,12 +279,27 @@ export async function handleAuthRemove(request: Request, env: Env): Promise<Resp
     );
   }
 
+  await clearAdminPassword(env);
+
+  return json({ ok: true, data: { status: "removed" } });
+}
+
+/** Persists a D1-managed admin password. Shared by the web setup endpoint and
+ * the controller bot so both use the same salt/hash format. */
+export async function storeAdminPassword(env: Env, password: string): Promise<void> {
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt);
+  await env.DB.batch([
+    env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('admin_password_hash', ?)").bind(hash),
+    env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('admin_password_salt', ?)").bind(salt),
+  ]);
+}
+
+export async function clearAdminPassword(env: Env): Promise<void> {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM app_settings WHERE key = 'admin_password_hash'"),
     env.DB.prepare("DELETE FROM app_settings WHERE key = 'admin_password_salt'"),
   ]);
-
-  return json({ ok: true, data: { status: "removed" } });
 }
 
 /**

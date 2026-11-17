@@ -1,10 +1,12 @@
 import { TelegramApiError } from "./errors";
 import type {
   TelegramApiResponse,
+  TelegramBotCommand,
   TelegramChat,
   TelegramChatInviteLink,
   TelegramChatMember,
   TelegramMessage,
+  TelegramSendMessageOptions,
   TelegramUser,
   TelegramUpdate,
 } from "./types";
@@ -71,7 +73,9 @@ export class TelegramClient {
     return this.call("getWebhookInfo");
   }
 
-  getUpdates(params: { offset?: number; limit?: number; allowed_updates?: string[] } = {}): Promise<TelegramUpdate[]> {
+  getUpdates(
+    params: { offset?: number; limit?: number; allowed_updates?: string[]; timeout?: number } = {},
+  ): Promise<TelegramUpdate[]> {
     return this.call("getUpdates", params);
   }
 
@@ -115,8 +119,29 @@ export class TelegramClient {
     return this.call("unbanChatMember", { chat_id: chatId, user_id: userId, only_if_banned: true });
   }
 
-  sendMessage(chatId: string | number, text: string): Promise<TelegramMessage> {
-    return this.call("sendMessage", { chat_id: chatId, text });
+  sendMessage(chatId: string | number, text: string, options: TelegramSendMessageOptions = {}): Promise<TelegramMessage> {
+    return this.call("sendMessage", { chat_id: chatId, text, ...options });
+  }
+
+  editMessageText(
+    chatId: string | number,
+    messageId: number,
+    text: string,
+    options: TelegramSendMessageOptions = {},
+  ): Promise<TelegramMessage | true> {
+    return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text, ...options });
+  }
+
+  answerCallbackQuery(callbackQueryId: string, text?: string, showAlert = false): Promise<true> {
+    return this.call("answerCallbackQuery", {
+      callback_query_id: callbackQueryId,
+      ...(text ? { text } : {}),
+      ...(showAlert ? { show_alert: true } : {}),
+    });
+  }
+
+  setMyCommands(commands: TelegramBotCommand[]): Promise<true> {
+    return this.call("setMyCommands", { commands });
   }
 
   deleteMessage(chatId: string | number, messageId: number): Promise<true> {

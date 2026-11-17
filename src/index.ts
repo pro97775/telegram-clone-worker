@@ -1,5 +1,4 @@
 import {
-  handleBulkAddBots,
   handleDeleteBot,
   handleDisconnectBotWebhook,
   handleInspectBot,
@@ -8,12 +7,6 @@ import {
   handleUpdateBot,
   handleVerifyBot,
 } from "./routes/api/bots";
-import {
-  handleBulkCreateChannels,
-  handleDeleteChannel,
-  handleListChannels,
-  handleUpdateChannel,
-} from "./routes/api/channels";
 import {
   handleAdHocTestCopy,
   handleBan,
@@ -50,13 +43,20 @@ import {
   handleAuthSetup,
   handleAuthStatus,
 } from "./auth/handler";
+import {
+  handleControllerDisableWebhook,
+  handleControllerSetup,
+  handleControllerStatus,
+  handleControllerWebhook,
+} from "./bot/api";
+import { runControllerPoll } from "./bot/poll";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
@@ -66,6 +66,12 @@ export default {
       // Public health check
       if (parts[1] === "health") {
         return json({ ok: true, data: { status: "up" } });
+      }
+
+      // Telegram webhook for the controller bot. Authenticated by Telegram's
+      // secret header instead of the console session, so it stays public.
+      if (parts[1] === "bot-controller" && parts[2] === "webhook" && parts.length === 3) {
+        return handleControllerWebhook(request, env, ctx);
       }
 
       // Public authentication routes
@@ -89,6 +95,18 @@ export default {
       const authError = await authenticateApiRequest(request, env);
       if (authError) return authError;
 
+      // /api/bot-controller — controller configuration and webhook lifecycle
+      if (parts[1] === "bot-controller") {
+        if (parts.length === 2 && request.method === "GET") return handleControllerStatus(request, env);
+        if (parts[2] === "setup" && parts.length === 3 && request.method === "POST") {
+          return handleControllerSetup(request, env, url.origin);
+        }
+        if (parts[2] === "disable-webhook" && parts.length === 3 && request.method === "POST") {
+          return handleControllerDisableWebhook(request, env);
+        }
+        return json({ ok: false, errorCode: 404, description: "not found", reason: "invalid_request" }, 404);
+      }
+
       const botId = url.searchParams.get("botId") ?? "";
       const botToken = url.searchParams.get("token") ?? "";
       const botTelegramId = url.searchParams.get("botTelegramId") ?? "";
@@ -96,25 +114,6 @@ export default {
       // /api/bots
       if (parts[1] === "bots" && parts.length === 2) {
         if (request.method === "GET") return handleListBots(env);
-        if (request.method === "POST") return handleBulkAddBots(request, env, url.origin);
-      }
-
-      // /api/bots/bulk — verify & save multiple bot tokens at once
-      if (parts[1] === "bots" && parts[2] === "bulk" && parts.length === 3 && request.method === "POST") {
-        return handleBulkAddBots(request, env, url.origin);
-      }
-
-      // /api/channels — saved Source & Target channels
-      if (parts[1] === "channels" && parts.length === 2) {
-        if (request.method === "GET") return handleListChannels(env, url.searchParams.get("role") ?? "");
-        if (request.method === "POST") return handleBulkCreateChannels(request, env);
-      }
-      if (parts[1] === "channels" && parts[2] === "bulk" && parts.length === 3 && request.method === "POST") {
-        return handleBulkCreateChannels(request, env);
-      }
-      if (parts[1] === "channels" && parts.length === 3) {
-        if (request.method === "PATCH") return handleUpdateChannel(request, env, parts[2]);
-        if (request.method === "DELETE") return handleDeleteChannel(env, parts[2]);
       }
 
       // /api/bots/sync-webhooks — cleans inactive bot webhooks & tightens allowed_updates
@@ -242,6 +241,15 @@ export default {
 
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await ensureDatabaseBootstrap(env.DB);
-    await runTick(env);
+    try {
+      await runTick(env);
+    } finally {
+      // Controller commands stay available even when a clone tick throws.
+      try {
+        await runControllerPoll(env);
+      } catch (e) {
+        console.error("controller poll failed", e);
+      }
+    }
   },
 };

@@ -81,6 +81,7 @@ export interface TelegramMessage {
   audio?: TelegramAudio;
   voice?: TelegramVoice;
   animation?: TelegramAnimation;
+  reply_markup?: TelegramInlineKeyboardMarkup;
 }
 
 export type ChatMemberStatus =
@@ -125,6 +126,7 @@ export interface TelegramUpdate {
   channel_post?: TelegramMessage;
   my_chat_member?: MyChatMemberUpdate;
   chat_member?: MyChatMemberUpdate;
+  callback_query?: TelegramCallbackQuery;
 }
 
 export interface TelegramChatInviteLink {
@@ -132,6 +134,34 @@ export interface TelegramChatInviteLink {
   creator: TelegramUser;
   is_primary: boolean;
   is_revoked: boolean;
+}
+
+export interface TelegramBotCommand {
+  command: string;
+  description: string;
+}
+
+export interface TelegramInlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+  url?: string;
+}
+
+export interface TelegramInlineKeyboardMarkup {
+  inline_keyboard: TelegramInlineKeyboardButton[][];
+}
+
+export interface TelegramCallbackQuery {
+  id: string;
+  from: TelegramUser;
+  message?: TelegramMessage;
+  data?: string;
+}
+
+export interface TelegramSendMessageOptions {
+  parse_mode?: "HTML" | "Markdown" | "MarkdownV2";
+  disable_web_page_preview?: boolean;
+  reply_markup?: TelegramInlineKeyboardMarkup | { remove_keyboard?: boolean };
 }
 
 export interface TelegramApiOk<T> {

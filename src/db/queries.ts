@@ -1,9 +1,7 @@
 import type {
   BackfillStatus,
   BotSummary,
-  ChannelRole,
   ErrorReason,
-  SavedChannel,
   SavedTaskSummary,
   SavedTaskWithToken,
   SourceTaskHistory,
@@ -36,14 +34,16 @@ export async function insertBot(
 
 export async function listBotsSummary(db: D1Database): Promise<BotSummary[]> {
   const { results } = await db
-    .prepare(`SELECT id, bot_id, bot_username, label, created_at FROM bots ORDER BY created_at DESC`)
+    .prepare(`SELECT id, bot_id, bot_username, label, created_at FROM bots ORDER BY created_at DESC, rowid DESC`)
     .all<BotSummary>();
   return results;
 }
 
 export async function listBotsWithSecrets(db: D1Database): Promise<BotRow[]> {
   const { results } = await db
-    .prepare(`SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, created_at FROM bots ORDER BY created_at DESC`)
+    .prepare(
+      `SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, created_at FROM bots ORDER BY created_at DESC, rowid DESC`,
+    )
     .all<BotRow>();
   return results;
 }
@@ -103,26 +103,6 @@ export async function findBotByTokenOrBotId(
 
 export async function updateBotLabel(db: D1Database, id: string, label: string): Promise<void> {
   await db.prepare(`UPDATE bots SET label = ? WHERE id = ?`).bind(label, id).run();
-}
-
-export async function updateBotTokenAndLabel(
-  db: D1Database,
-  id: string,
-  token: string,
-  botUsername: string,
-  label?: string,
-): Promise<void> {
-  if (label) {
-    await db
-      .prepare(`UPDATE bots SET token = ?, bot_username = ?, label = ? WHERE id = ?`)
-      .bind(token, botUsername, label, id)
-      .run();
-  } else {
-    await db
-      .prepare(`UPDATE bots SET token = ?, bot_username = ? WHERE id = ?`)
-      .bind(token, botUsername, id)
-      .run();
-  }
 }
 
 export async function deleteBot(db: D1Database, id: string): Promise<void> {
@@ -223,7 +203,7 @@ export async function insertTask(db: D1Database, t: NewTask): Promise<void> {
 
 export async function listTasksByBot(db: D1Database, botId: string): Promise<TaskSummary[]> {
   const { results } = await db
-    .prepare(`SELECT * FROM tasks WHERE bot_id = ? ORDER BY created_at DESC`)
+    .prepare(`SELECT * FROM tasks WHERE bot_id = ? ORDER BY created_at DESC, rowid DESC`)
     .bind(botId)
     .all();
   return results.map(rowToTask);
@@ -231,7 +211,7 @@ export async function listTasksByBot(db: D1Database, botId: string): Promise<Tas
 
 export async function listAllTasksSummary(db: D1Database): Promise<TaskSummary[]> {
   const { results } = await db
-    .prepare(`SELECT * FROM tasks ORDER BY created_at DESC`)
+    .prepare(`SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC`)
     .all();
   return results.map(rowToTask);
 }
@@ -833,7 +813,7 @@ export async function listSavedTasks(db: D1Database): Promise<SavedTaskSummary[]
               scope, backfill_mode, start_id, end_id, n, pacing_batch_size,
               filter_media_types, filter_min_size_bytes, filter_max_size_bytes,
               created_at
-       FROM saved_tasks ORDER BY created_at DESC`,
+       FROM saved_tasks ORDER BY created_at DESC, rowid DESC`,
     )
     .all<SavedTaskSummary>();
   return results;
@@ -924,133 +904,70 @@ export async function listTasksWithPendingMessages(db: D1Database): Promise<Task
   return results.map(rowToTask);
 }
 
-// Saved Channels (Source & Target)
+// App settings — small key/value store shared by auth and the controller bot.
 
-export async function listSavedChannels(db: D1Database, role?: ChannelRole): Promise<SavedChannel[]> {
-  if (role) {
-    const { results } = await db
-      .prepare(
-        `SELECT id, role, chat_id, title, username, label, created_at
-         FROM saved_channels
-         WHERE role = ?
-         ORDER BY created_at DESC`,
-      )
-      .bind(role)
-      .all<SavedChannel>();
-    return results;
-  }
-  const { results } = await db
-    .prepare(
-      `SELECT id, role, chat_id, title, username, label, created_at
-       FROM saved_channels
-       ORDER BY created_at DESC`,
-    )
-    .all<SavedChannel>();
-  return results;
+export async function getAppSetting(db: D1Database, key: string): Promise<string | null> {
+  const row = await db.prepare(`SELECT value FROM app_settings WHERE key = ?`).bind(key).first<{ value: string }>();
+  return row?.value ?? null;
 }
 
-export async function findSavedChannelByRoleAndChatId(
-  db: D1Database,
-  role: ChannelRole,
-  chatIds: string[],
-): Promise<SavedChannel | null> {
-  const valid = chatIds.filter(Boolean).map((c) => c.toLowerCase());
-  if (valid.length === 0) return null;
-  const placeholders = valid.map(() => "?").join(", ");
-  const row = await db
-    .prepare(
-      `SELECT id, role, chat_id, title, username, label, created_at
-       FROM saved_channels
-       WHERE role = ? AND LOWER(chat_id) IN (${placeholders})
-       LIMIT 1`,
-    )
-    .bind(role, ...valid)
-    .first<SavedChannel>();
-  return row ?? null;
-}
-
-export async function insertSavedChannel(
-  db: D1Database,
-  row: {
-    id: string;
-    role: ChannelRole;
-    chat_id: string;
-    title: string | null;
-    username: string | null;
-    label: string;
-  },
-): Promise<void> {
+export async function setAppSetting(db: D1Database, key: string, value: string): Promise<void> {
   await db
-    .prepare(
-      `INSERT INTO saved_channels (id, role, chat_id, title, username, label)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(row.id, row.role, row.chat_id, row.title ?? null, row.username ?? null, row.label)
+    .prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .bind(key, value)
     .run();
 }
 
-export async function updateSavedChannel(
-  db: D1Database,
-  id: string,
-  patch: { chat_id?: string; title?: string | null; username?: string | null; label?: string },
-): Promise<void> {
-  const sets: string[] = [];
-  const binds: unknown[] = [];
-  if (patch.chat_id !== undefined) {
-    sets.push("chat_id = ?");
-    binds.push(patch.chat_id);
-  }
-  if (patch.title !== undefined) {
-    sets.push("title = ?");
-    binds.push(patch.title ?? null);
-  }
-  if (patch.username !== undefined) {
-    sets.push("username = ?");
-    binds.push(patch.username ?? null);
-  }
-  if (patch.label !== undefined) {
-    sets.push("label = ?");
-    binds.push(patch.label);
-  }
-  if (sets.length === 0) return;
-  binds.push(id);
-  await db.prepare(`UPDATE saved_channels SET ${sets.join(", ")} WHERE id = ?`).bind(...binds).run();
+export async function deleteAppSetting(db: D1Database, key: string): Promise<void> {
+  await db.prepare(`DELETE FROM app_settings WHERE key = ?`).bind(key).run();
 }
 
-export async function enrichSavedChannelsByChatId(
+// Bot controller sessions — one live wizard/confirmation per admin chat.
+
+export interface BotControllerSessionRow {
+  chat_id: number;
+  user_id: number;
+  state: string;
+  data: string;
+  updated_at: number;
+}
+
+export async function getBotControllerSession(
   db: D1Database,
-  lookupIdentifiers: string[],
-  resolvedChatId: string,
-  title?: string,
-  username?: string,
+  chatId: number,
+): Promise<BotControllerSessionRow | null> {
+  const row = await db
+    .prepare(`SELECT chat_id, user_id, state, data, updated_at FROM bot_controller_sessions WHERE chat_id = ?`)
+    .bind(chatId)
+    .first<BotControllerSessionRow>();
+  return row ?? null;
+}
+
+export async function setBotControllerSession(
+  db: D1Database,
+  chatId: number,
+  userId: number,
+  state: string,
+  data: object,
 ): Promise<void> {
-  const valid = lookupIdentifiers.filter(Boolean).map((c) => c.toLowerCase());
-  if (valid.length === 0) return;
-  const placeholders = valid.map(() => "?").join(", ");
-  const { results } = await db
+  await db
     .prepare(
-      `SELECT id, chat_id, title, username, label
-       FROM saved_channels
-       WHERE LOWER(chat_id) IN (${placeholders})`,
+      `INSERT INTO bot_controller_sessions (chat_id, user_id, state, data, updated_at)
+       VALUES (?, ?, ?, ?, unixepoch())
+       ON CONFLICT(chat_id) DO UPDATE SET
+         user_id = excluded.user_id,
+         state = excluded.state,
+         data = excluded.data,
+         updated_at = unixepoch()`,
     )
-    .bind(...valid)
-    .all<SavedChannel>();
-
-  for (const row of results) {
-    const newTitle = title ?? row.title;
-    const newUsername = username ?? row.username;
-    const isDefaultLabel = row.label === row.chat_id || row.label === `@${row.username}`;
-    const newLabel = isDefaultLabel && newTitle ? newTitle : row.label;
-    await updateSavedChannel(db, row.id, {
-      chat_id: resolvedChatId || row.chat_id,
-      title: newTitle,
-      username: newUsername,
-      label: newLabel,
-    });
-  }
+    .bind(chatId, userId, state, JSON.stringify(data))
+    .run();
 }
 
-export async function deleteSavedChannel(db: D1Database, id: string): Promise<void> {
-  await db.prepare(`DELETE FROM saved_channels WHERE id = ?`).bind(id).run();
+export async function clearBotControllerSession(db: D1Database, chatId: number): Promise<void> {
+  await db.prepare(`DELETE FROM bot_controller_sessions WHERE chat_id = ?`).bind(chatId).run();
 }
 
+export async function pruneBotControllerSessions(db: D1Database, maxAgeSeconds: number): Promise<void> {
+  await db.prepare(`DELETE FROM bot_controller_sessions WHERE updated_at < unixepoch() - ?`).bind(maxAgeSeconds).run();
+}

@@ -1,5 +1,5 @@
 import { TelegramClient } from "../../telegram/client";
-import { TelegramApiError, toResult, type Result } from "../../telegram/errors";
+import { toResult, type Result } from "../../telegram/errors";
 import {
   deleteBot,
   findBotByTokenOrBotId,
@@ -10,16 +10,14 @@ import {
   listBotsWithSecrets,
   listTasksByBot,
   updateBotLabel,
-  updateBotTokenAndLabel,
 } from "../../db/queries";
 import type {
   BotInspectionReport,
   BotSummary,
   BotVerifyResult,
-  BulkBotsResult,
   TaskSummary,
 } from "../../shared/rpcTypes";
-import { parseTelegramUpdate, type ParsedBotActivity } from "../../shared/updateParser";
+import { inspectBot } from "../../telegram/diagnostics";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -145,73 +143,10 @@ export async function handleInspectBot(request: Request, env: Env): Promise<Resp
   }
 
   const client = new TelegramClient(token);
-  const result: Result<BotInspectionReport> = await toResult(async () => {
-    const me = await client.getMe();
-    const webhookInfo = await client.getWebhookInfo().catch(() => null);
-
-    const existing = existingBotId
-      ? await getBotWithSecrets(env.DB, existingBotId)
-      : await findBotByTokenOrBotId(env.DB, token!, me.id);
-
-    let active_tasks: TaskSummary[] = [];
-    let rate_limit_info = {
-      is_cooling_down: false,
-      cooldown_until: null as number | null,
-      cooldown_seconds_remaining: 0,
-      events_last_24h: 0,
-    };
-
-    if (existing) {
-      const allTasks = await listTasksByBot(env.DB, existing.id);
-      active_tasks = allTasks.filter(
-        (t) => t.live_enabled || t.backfill_status === "running" || t.backfill_status === "paused",
-      );
-      rate_limit_info = await getBotRateLimitStats(env.DB, existing.id);
-    }
-
-    let conflict_detected = false;
-    let conflict_message: string | undefined;
-    let recent_activities: ParsedBotActivity[] = [];
-
-    const isWebhookActive = Boolean(webhookInfo?.url);
-
-    // If no webhook is active, probe getUpdates for pending messages or polling conflicts
-    if (!isWebhookActive) {
-      try {
-        const rawUpdates = await client.getUpdates({ limit: 8 });
-        if (rawUpdates && rawUpdates.length > 0) {
-          recent_activities = rawUpdates.map(parseTelegramUpdate);
-        }
-      } catch (e) {
-        if (e instanceof TelegramApiError && e.errorCode === 409) {
-          conflict_detected = true;
-          conflict_message = e.message || "Conflict: terminated by other getUpdates request (another bot script or Pyrogram session is actively running)";
-        }
-      }
-    }
-
-    return {
-      bot_id: me.id,
-      bot_username: me.username ?? me.first_name,
-      clone_worker_tasks: {
-        active_count: active_tasks.length,
-        tasks: active_tasks,
-      },
-      webhook: {
-        is_active: isWebhookActive,
-        url: webhookInfo?.url || undefined,
-        pending_update_count: webhookInfo?.pending_update_count ?? 0,
-        last_error_message: webhookInfo?.last_error_message,
-        last_error_date: webhookInfo?.last_error_date,
-      },
-      polling_session: {
-        conflict_detected,
-        message: conflict_message,
-      },
-      rate_limits: rate_limit_info,
-      recent_activities,
-    };
-  });
+  const existing = existingBotId
+    ? await getBotWithSecrets(env.DB, existingBotId)
+    : await findBotByTokenOrBotId(env.DB, token);
+  const result: Result<BotInspectionReport> = await inspectBot(env.DB, client, existing?.id ?? null);
 
   return json(result, result.ok ? 200 : 400);
 }
@@ -254,21 +189,9 @@ export async function createBotRecord(env: Env, _origin: string, token: string, 
   const client = new TelegramClient(token);
   return toResult(async () => {
     const me = await client.getMe();
-    const botUsername = me.username ?? me.first_name;
-    const existing = await findBotByTokenOrBotId(env.DB, token, me.id);
-    if (existing) {
-      await updateBotTokenAndLabel(env.DB, existing.id, token, botUsername, label);
-      return {
-        id: existing.id,
-        bot_id: me.id,
-        bot_username: botUsername,
-        label: label || existing.label,
-        created_at: existing.created_at,
-      };
-    }
-
     const id = crypto.randomUUID();
     const webhookSecret = crypto.randomUUID().replace(/-/g, "");
+    const botUsername = me.username ?? me.first_name;
     const botLabel = label || botUsername;
     await insertBot(env.DB, {
       id,
@@ -280,108 +203,6 @@ export async function createBotRecord(env: Env, _origin: string, token: string, 
     });
     return { id, bot_id: me.id, bot_username: botUsername, label: botLabel, created_at: Math.floor(Date.now() / 1000) };
   });
-}
-
-function parseBotTokenInput(rawInput: string): Array<{ token: string; label?: string }> {
-  const entries: Array<{ token: string; label?: string }> = [];
-  const seen = new Set<string>();
-  const lines = rawInput.split(/\r?\n/);
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-
-    const tokenMatches = line.match(/\d+:[A-Za-z0-9_-]{20,}/g);
-    if (tokenMatches && tokenMatches.length > 1) {
-      for (const t of tokenMatches) {
-        if (!seen.has(t)) {
-          seen.add(t);
-          entries.push({ token: t });
-        }
-      }
-    } else if (tokenMatches && tokenMatches.length === 1) {
-      const token = tokenMatches[0];
-      const remainder = line
-        .replace(token, "")
-        .replace(/^[\s|,\-:()]+|[\s|,\-:()]+$/g, "")
-        .trim();
-      if (!seen.has(token)) {
-        seen.add(token);
-        entries.push({ token, label: remainder || undefined });
-      }
-    } else {
-      const parts = line
-        .split(/[\s,]+/)
-        .map((p) => p.trim())
-        .filter(Boolean);
-      for (const p of parts) {
-        if (!seen.has(p)) {
-          seen.add(p);
-          entries.push({ token: p });
-        }
-      }
-    }
-  }
-
-  return entries;
-}
-
-export async function handleBulkAddBots(request: Request, env: Env, origin: string): Promise<Response> {
-  try {
-    const body = (await request.json().catch(() => ({}))) as {
-      rawInput?: string;
-      tokens?: string[];
-    };
-
-    const combinedInput = body.rawInput ?? (Array.isArray(body.tokens) ? body.tokens.join("\n") : "");
-    const parsed = parseBotTokenInput(combinedInput);
-
-    if (parsed.length === 0) {
-      return json(
-        { ok: false, errorCode: 400, description: "At least one bot token is required", reason: "invalid_request" },
-        400,
-      );
-    }
-
-    const added: BotSummary[] = [];
-    const errors: Array<{ tokenPreview: string; error: string }> = [];
-
-    for (const item of parsed) {
-      const res = await createBotRecord(env, origin, item.token, item.label);
-      if (res.ok) {
-        added.push(res.data);
-      } else {
-        const preview =
-          item.token.length > 12 ? `${item.token.slice(0, 6)}…${item.token.slice(-4)}` : item.token;
-        errors.push({ tokenPreview: preview, error: res.description });
-      }
-    }
-
-    if (added.length === 0 && errors.length > 0) {
-      return json(
-        {
-          ok: false,
-          errorCode: 400,
-          description: errors.map((e) => `${e.tokenPreview}: ${e.error}`).join("; "),
-          reason: "invalid_request",
-          data: { added, errors } satisfies BulkBotsResult,
-        },
-        400,
-      );
-    }
-
-    return json({ ok: true, data: { added, errors } satisfies BulkBotsResult });
-  } catch (err) {
-    return json(
-      {
-        ok: false,
-        errorCode: 500,
-        description: err instanceof Error ? err.message : String(err),
-        reason: "unknown",
-      },
-      500,
-    );
-  }
 }
 
 export async function handleUpdateBot(request: Request, env: Env, id: string): Promise<Response> {
